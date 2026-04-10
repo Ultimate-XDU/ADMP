@@ -1,0 +1,81 @@
+{
+  "knowledgeBases": [
+    {
+      "id": 101,
+      "name": "民航规章",
+      "description": "中国民航局发布的适航规章，如 CCAR-25、CCAR-33、CCAR-35、CCAR-121 等运输类飞机/发动机/螺旋桨适航标准与运行规则。",
+      "creator": "系统预置",
+      "createdAt": "2026-04-01 00:00"
+    },
+    {
+      "id": 102,
+      "name": "规范性文件",
+      "description": "民航局及下属司局发布的管理办法、实施细则、咨询通告（AC）等规范性文件。",
+      "creator": "系统预置",
+      "createdAt": "2026-04-01 00:00"
+    },
+    {
+      "id": 103,
+      "name": "法律法规",
+      "description": "《中华人民共和国民用航空法》及相关行政法规、国务院令等上位法律法规。",
+      "creator": "系统预置",
+      "createdAt": "2026-04-01 00:00"
+    },
+    {
+      "id": 104,
+      "name": "国际公约",
+      "description": "ICAO 国际民航公约及附件、FAA/EASA 对等适航协议与国际标准参考。",
+      "creator": "系统预置",
+      "createdAt": "2026-04-01 00:00"
+    },
+    {
+      "id": 105,
+      "name": "适航指令与通告",
+      "description": "适航指令（AD）、服务通告（SB）、维护通告与适航改进通知。",
+      "creator": "系统预置",
+      "createdAt": "2026-04-01 00:00"
+    },
+    {
+      "id": 106,
+      "name": "维修手册与技术文档",
+      "description": "飞机/发动机维修手册（AMM/EMM）、故障隔离手册（FIM/TSM）、结构修理手册等技术文档。",
+      "creator": "系统预置",
+      "createdAt": "2026-04-01 00:00"
+    },
+    {
+      "id": 107,
+      "name": "培训与参考资料",
+      "description": "培训课件、答辩汇报、术语词典、缩略语映射与其他参考资料。",
+      "creator": "系统预置",
+      "createdAt": "2026-04-01 00:00"
+    }
+  ],
+  "documents": [
+    {
+      "id": 4002,
+      "fileName": "航空发动机适航规定",
+      "knowledgeBaseId": 101,
+      "type": "PDF",
+      "size": "1.9 MB",
+      "chunkCount": 142,
+      "status": "READY",
+      "uploadedAt": "2026-04-10 23:28",
+      "summary": "",
+      "storageFileName": "航空发动机适航规定.pdf"
+    },
+    {
+      "id": 4001,
+      "fileName": "大型飞机公共航空运输承运人运行合格审定规则",
+      "knowledgeBaseId": 102,
+      "type": "PDF",
+      "size": "1.7 MB",
+      "chunkCount": 0,
+      "status": "READY",
+      "uploadedAt": "2026-04-10 22:44",
+      "summary": "",
+      "storageFileName": "大型飞机公共航空运输承运人运行合格审定规则.pdf"
+    }
+  ],
+  "kbIdCounter": 200,
+  "docIdCounter": 4002
+}
