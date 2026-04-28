@@ -32,15 +32,12 @@ import {
   Plus,
   Radar,
   Search,
-  ShieldCheck,
   Trash2,
   UploadCloud,
   Wrench,
   X,
 } from "lucide-react";
 import {
-  cloneAssistantConversation,
-  resolveAssistantConversation,
   type AssistantCitation,
   type AssistantConversation,
   type AssistantDocumentType,
@@ -106,7 +103,7 @@ type AssistantHistoryItem = {
   question: string;
   createdAt: number;
   preview: string;
-  conversation: AssistantConversation;
+  conversation?: AssistantConversation;
 };
 
 const routePathMap: Record<AppRoute, string> = {
@@ -499,136 +496,408 @@ async function uploadFileWithProgress(
 }
 
 // ------- 真实 QA API 调用 -------
-type QAApiSource = {
+type QAApiEvidenceSource = {
   content: string;
   doc_name: string;
-  heading: string;
-  parent_heading: string;
-  score: number;
-  chunk_id: string;
+  heading?: string;
+  parent_heading?: string;
+  score?: number;
+  chunk_id?: string;
+  page_number?: number;
+  page_count?: number;
+  section_title?: string;
+  highlight_text?: string;
+  bbox?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  source_type?: string;
+  layout_type?: string;
+  parse_confidence?: number;
+  document_type?: string;
+  is_ocr_fallback?: boolean;
 };
 
-type QAApiResponse = {
+type QAApiEvidenceResponse = {
   answer: string;
-  sources: QAApiSource[];
+  sources: QAApiEvidenceSource[];
+  confidence?: number;
+  abstainReason?: string;
+  evidenceIds?: string[];
+  queryType?: string;
+  conversationId?: string;
+  createdAt?: number;
+  updatedAt?: number;
 };
 
-async function callQAApi(question: string): Promise<AssistantConversation | null> {
+type ChatConversationSummary = {
+  id: string;
+  title: string;
+  question: string;
+  preview: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
+type ChatMessageRecord = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  payload?: QAApiEvidenceResponse | null;
+  createdAt: number;
+};
+
+type ChatConversationDetail = ChatConversationSummary & {
+  messages: ChatMessageRecord[];
+};
+
+function buildAssistantConversationFromQAData(
+  question: string,
+  data: QAApiEvidenceResponse,
+  options: {
+    conversationId?: string;
+    turnId?: string;
+    createdAt?: number;
+    baseConversation?: AssistantConversation | null;
+  } = {},
+): AssistantConversation {
+  const ts = options.createdAt ?? data.updatedAt ?? Date.now();
+  const conversationId = data.conversationId || options.conversationId || options.baseConversation?.id || `api-${ts}`;
+  const turnId = options.turnId || `${conversationId}-${ts}`;
+  const rawSources = Array.isArray(data.sources) ? data.sources : [];
+  const base = options.baseConversation ?? null;
+
+  const normalizeDocumentType = (value?: string): AssistantDocumentType => {
+    const normalized = String(value || "").toUpperCase();
+    if (normalized === "FIM" || normalized === "TSM" || normalized === "IPC" || normalized === "SRM") return normalized;
+    return "AMM";
+  };
+
+  const normalizeEvidenceText = (value?: string) => String(value || "").replace(/\s+/g, " ").trim();
+  const stripDocumentExtension = (value?: string) =>
+    normalizeEvidenceText(value).replace(/\.(pdf|docx|pptx|xlsx)$/i, "").trim();
+  const buildPreviewTemplate = (docName: string, sourceKey: string) =>
+    `${managementApiBase}/evidence/page-image?doc_name=${encodeURIComponent(docName)}&page=__PAGE__&dpi=144&source_key=${encodeURIComponent(sourceKey)}`;
+  const toChineseNumeral = (value: number) => {
+    if (!Number.isFinite(value) || value <= 0) return "";
+    const digits = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+    if (value < 10) return digits[value];
+    if (value < 10000) {
+      const units = ["", "十", "百", "千"];
+      const chars = String(value).split("");
+      let output = "";
+      let zeroPending = false;
+      chars.forEach((char, index) => {
+        const digit = Number(char);
+        const unitIndex = chars.length - index - 1;
+        if (digit === 0) {
+          zeroPending = output.length > 0;
+          return;
+        }
+        if (zeroPending) {
+          output += "零";
+          zeroPending = false;
+        }
+        if (!(digit === 1 && unitIndex === 1 && output.length === 0)) {
+          output += digits[digit];
+        }
+        output += units[unitIndex];
+      });
+      return output;
+    }
+    return String(value);
+  };
+  const buildArticleQueryVariants = (text: string) => {
+    const normalized = normalizeEvidenceText(text);
+    const match = normalized.match(/第\s*([0-9A-Za-z一二三四五六七八九十百千万]+(?:\.[0-9A-Za-z一二三四五六七八九十百千万]+)*)\s*条/);
+    if (!match) return [] as string[];
+    const variants = new Set<string>();
+    const rawId = normalizeEvidenceText(match[1]);
+    variants.add(normalizeEvidenceText(match[0]));
+    if (/^\d+$/.test(rawId)) {
+      const chinese = toChineseNumeral(Number(rawId));
+      if (chinese) variants.add(`第${chinese}条`);
+    }
+    return [...variants].filter(Boolean);
+  };
+  const articleQueryVariants = buildArticleQueryVariants(question);
+  const queryKeywords = normalizeEvidenceText(question)
+    .split(/[^\u4e00-\u9fa5A-Za-z0-9.]+/)
+    .filter((token) => token.length >= 2);
+
+  const extractHighlight = (src: QAApiEvidenceSource): string => {
+    if (src.highlight_text) return src.highlight_text;
+    if (src.heading) return src.heading;
+    const firstLines = String(src.content || "").split("\n").filter(Boolean).slice(0, 3);
+    return firstLines.find((line) => line.length >= 8 && line.length <= 200) ?? firstLines[0] ?? "";
+  };
+
+  const formatLines = (content: string): string[] => {
+    const raw = content
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    const merged: string[] = [];
+    let buffer = "";
+
+    for (const line of raw) {
+      if (line.length <= 2 && !/^[\d]+[.、)]?$/.test(line)) {
+        buffer += line;
+        continue;
+      }
+
+      if (buffer) {
+        if (buffer.length >= 10) {
+          merged.push(buffer);
+        } else {
+          merged.push(buffer + line);
+          buffer = "";
+          continue;
+        }
+        buffer = "";
+      }
+      merged.push(line);
+    }
+
+    if (buffer) merged.push(buffer);
+    return merged.length > 0 ? merged : ["（无内容）"];
+  };
+
+  const citations: AssistantCitation[] = rawSources.map((src, index) => {
+    const page = Math.max(1, src.page_number || 1);
+    const chapter = normalizeEvidenceText(src.section_title || src.heading || src.parent_heading || "");
+    const highlight = normalizeEvidenceText(extractHighlight(src));
+    const documentTitle = normalizeEvidenceText(src.doc_name || "检索文档");
+    const compactDocumentTitle = stripDocumentExtension(documentTitle) || "检索文档";
+    const compactHighlight = highlight || chapter || "定位证据";
+    const sourceId = `${turnId}-s${index + 1}`;
+
+    return {
+      id: `${turnId}-c${index + 1}`,
+      label: `${compactDocumentTitle} / ${compactHighlight} / P${page}`.slice(0, 72),
+      sourceId,
+      documentTitle,
+      documentType: normalizeDocumentType(src.document_type),
+      chapter,
+      page,
+      quotedText: String(src.content || "").slice(0, 400),
+      highlightText: highlight,
+      snippet: String(src.content || "").slice(0, 400),
+      evidenceLocation: {
+        page,
+        chapter,
+        textAnchor: highlight,
+        bbox: src.bbox,
+      },
+    };
+  });
+
+  const citationPriority = (src: QAApiEvidenceSource, citation: AssistantCitation) => {
+    const haystack = normalizeEvidenceText(
+      [src.section_title, src.heading, src.highlight_text, src.content, citation.label].filter(Boolean).join("\n"),
+    );
+    let score = 0;
+    if (src.bbox) score += 2.2;
+    if (src.source_type === "text") score += 0.8;
+    if (articleQueryVariants.some((variant) => haystack.includes(normalizeEvidenceText(variant)))) score += 4.5;
+    score += queryKeywords.reduce((total, token) => total + (haystack.includes(token) ? 0.18 : 0), 0);
+    return score;
+  };
+
+  const sources: AssistantSource[] = rawSources.map((src, index) => {
+    const page = Math.max(1, src.page_number || 1);
+    const chapter = normalizeEvidenceText(src.section_title || src.heading || src.parent_heading || "");
+    const highlight = normalizeEvidenceText(extractHighlight(src));
+    const docName = normalizeEvidenceText(src.doc_name || "检索文档");
+    const sourceId = `${turnId}-s${index + 1}`;
+    const previewImageTemplate = docName.toLowerCase().endsWith(".pdf")
+      ? buildPreviewTemplate(docName, `${sourceId}-${src.chunk_id || docName}`)
+      : undefined;
+
+    return {
+      id: sourceId,
+      documentTitle: docName,
+      documentType: normalizeDocumentType(src.document_type),
+      aircraftModel: "ALL",
+      chapter,
+      pageCount: Math.max(page, src.page_count || 1),
+      snippet: String(src.content || "").slice(0, 300),
+      previewMode: previewImageTemplate ? "image" : "text",
+      previewImageTemplate,
+      pages: [
+        {
+          pageNumber: page,
+          sectionTitle: chapter || highlight || "检索结果",
+          lines: formatLines(String(src.content || "")),
+          previewImageUrl: previewImageTemplate?.replace("__PAGE__", String(page)),
+        },
+      ],
+    };
+  });
+
+  const bestCitationIndex = citations.reduce((bestIndex, citation, index) => {
+    if (bestIndex < 0) return index;
+    const currentScore = citationPriority(rawSources[index], citation);
+    const bestScore = citationPriority(rawSources[bestIndex], citations[bestIndex]);
+    return currentScore > bestScore ? index : bestIndex;
+  }, citations.length > 0 ? 0 : -1);
+  const defaultCitationId = bestCitationIndex >= 0 ? citations[bestCitationIndex]?.id ?? "" : "";
+
+  const segments: AssistantMessageSegment[] = [
+    {
+      id: `${turnId}-seg-answer`,
+      kind: "paragraph",
+      text: data.answer || "未获取到回答。",
+      citationIds: citations.map((citation) => citation.id),
+    },
+  ];
+
+  return {
+    id: conversationId,
+    quickPrompt: base?.quickPrompt || question,
+    userQuestion: question,
+    aircraftModel: base?.aircraftModel || "ALL",
+    documentTypeFocus: base?.documentTypeFocus || "ALL",
+    defaultCitationId: defaultCitationId || base?.defaultCitationId || "",
+    messages: [
+      ...(base?.messages ?? []),
+      { id: `${turnId}-user`, role: "user", content: question },
+      { id: `${turnId}-assistant`, role: "assistant", segments },
+    ],
+    citations: [...(base?.citations ?? []), ...citations],
+    sources: [...(base?.sources ?? []), ...sources],
+  };
+}
+
+async function callEvidenceAwareQAApi(
+  question: string,
+  conversationId?: string,
+  baseConversation?: AssistantConversation | null,
+): Promise<AssistantConversation | null> {
   try {
     const response = await fetch(`${managementApiBase}/qa`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ question, ...(conversationId ? { conversationId } : {}) }),
     });
     if (!response.ok) throw new Error(`QA API error: ${response.status}`);
-    const data: QAApiResponse = await response.json();
-    const ts = Date.now();
-    const convId = `api-${ts}`;
-
-    // 为每个 source 提取用于高亮的关键句（取 heading 或内容前两行中较短的行）
-    const extractHighlight = (src: QAApiSource): string => {
-      if (src.heading) return src.heading;
-      const firstLines = src.content.split("\n").filter(Boolean).slice(0, 3);
-      return firstLines.find((l) => l.length >= 8 && l.length <= 200) ?? firstLines[0] ?? "";
-    };
-
-    // 将原始内容整理为格式良好的行：按换行拆分，合并过短的相邻行以避免竖排效果
-    const formatLines = (content: string): string[] => {
-      const raw = content
-        .split("\n")
-        .map((l) => l.trim())
-        .filter((l) => l.length > 0);
-      // 合并连续的短行（单字或极短行可能来自 PDF 竖排提取）
-      const merged: string[] = [];
-      let buffer = "";
-      for (const line of raw) {
-        if (line.length <= 2 && !/^[\d]+[.、)]?$/.test(line)) {
-          buffer += line;
-        } else {
-          if (buffer) {
-            // 若 buffer 自身够长则单独成行，否则拼到当前行前面
-            if (buffer.length >= 10) {
-              merged.push(buffer);
-              buffer = "";
-            } else {
-              merged.push(buffer + line);
-              buffer = "";
-              continue;
-            }
-          }
-          merged.push(line);
-        }
-      }
-      if (buffer) merged.push(buffer);
-      return merged.length > 0 ? merged : ["（无内容）"];
-    };
-
-    const citations: AssistantCitation[] = data.sources.map((src, i) => {
-      const highlight = extractHighlight(src);
-      return {
-        id: `${convId}-c${i + 1}`,
-        label: `来源${i + 1}: ${src.doc_name}${src.heading ? " · " + src.heading : ""}`.slice(0, 48),
-        sourceId: `${convId}-s${i + 1}`,
-        documentTitle: src.doc_name || "检索文档",
-        documentType: "AMM" as AssistantDocumentType,
-        chapter: src.heading || src.parent_heading || "",
-        page: 1,
-        quotedText: src.content.slice(0, 400),
-        highlightText: highlight,
-        snippet: src.content.slice(0, 400),
-        evidenceLocation: {
-          page: 1,
-          chapter: src.heading || "",
-          textAnchor: highlight,
-        },
-      };
+    const data: QAApiEvidenceResponse = await response.json();
+    return buildAssistantConversationFromQAData(question, data, {
+      conversationId,
+      baseConversation,
+      createdAt: data.updatedAt ?? Date.now(),
     });
-
-    const sources: AssistantSource[] = data.sources.map((src, i) => ({
-      id: `${convId}-s${i + 1}`,
-      documentTitle: src.doc_name || "检索文档",
-      documentType: "AMM" as AssistantDocumentType,
-      aircraftModel: "ALL",
-      chapter: src.heading || src.parent_heading || "",
-      pageCount: 1,
-      snippet: src.content.slice(0, 300),
-      pages: [
-        {
-          pageNumber: 1,
-          sectionTitle: src.heading || src.parent_heading || "检索结果",
-          lines: formatLines(src.content),
-        },
-      ],
-    }));
-
-    // 回答整体作为一个 segment，所有 citation 附在底部
-    const segments: AssistantMessageSegment[] = [
-      {
-        id: `${convId}-seg-answer`,
-        kind: "paragraph",
-        text: data.answer || "未获取到回答。",
-        citationIds: citations.map((c) => c.id),
-      },
-    ];
-
-    return {
-      id: convId,
-      quickPrompt: question,
-      userQuestion: question,
-      aircraftModel: "ALL",
-      documentTypeFocus: "ALL",
-      defaultCitationId: citations[0]?.id ?? "",
-      messages: [
-        { id: `${convId}-user`, role: "user", content: question },
-        { id: `${convId}-assistant`, role: "assistant", segments },
-      ],
-      citations,
-      sources,
-    };
   } catch (err) {
-    console.warn("QA API unavailable, falling back to mock:", err);
+    console.warn("QA API unavailable; showing service status message instead of mock evidence.", err);
     return null;
   }
+}
+
+function createServiceUnavailableConversation(
+  question: string,
+  baseConversation?: AssistantConversation | null,
+): AssistantConversation {
+  const ts = Date.now();
+  return buildAssistantConversationFromQAData(
+    question,
+    {
+      answer:
+        "后端检索服务暂不可用，无法完成基于文档证据的问答。请先确认 Docker 中的 Elasticsearch 和 Milvus 已启动，后端健康检查恢复正常后再重试。",
+      sources: [],
+      conversationId: baseConversation?.id || `local-unavailable-${ts}`,
+    },
+    {
+      conversationId: baseConversation?.id || `local-unavailable-${ts}`,
+      baseConversation,
+      createdAt: ts,
+    },
+  );
+}
+
+function buildAssistantConversationFromChatDetail(detail: ChatConversationDetail): AssistantConversation {
+  let conversation: AssistantConversation | null = null;
+  let latestUserQuestion = detail.question || detail.title || "历史会话";
+
+  detail.messages.forEach((message) => {
+    if (message.role === "user") {
+      latestUserQuestion = message.content || latestUserQuestion;
+      return;
+    }
+
+    const payload: QAApiEvidenceResponse = {
+      ...(message.payload ?? {}),
+      answer: message.payload?.answer || message.content,
+      sources: Array.isArray(message.payload?.sources) ? message.payload.sources : [],
+      conversationId: detail.id,
+    };
+    conversation = buildAssistantConversationFromQAData(latestUserQuestion, payload, {
+      conversationId: detail.id,
+      turnId: `${detail.id}-${message.id}`,
+      createdAt: message.createdAt,
+      baseConversation: conversation,
+    });
+  });
+
+  return (
+    conversation ?? {
+      id: detail.id,
+      quickPrompt: latestUserQuestion,
+      userQuestion: latestUserQuestion,
+      aircraftModel: "ALL",
+      documentTypeFocus: "ALL",
+      defaultCitationId: "",
+      messages: detail.messages
+        .filter((message) => message.role === "user")
+        .map((message) => ({ id: `${detail.id}-${message.id}`, role: "user", content: message.content })),
+      citations: [],
+      sources: [],
+    }
+  );
+}
+
+async function listPersistedAssistantHistory(): Promise<AssistantHistoryItem[]> {
+  const response = await fetch(`${managementApiBase}/chat/conversations`);
+  if (!response.ok) throw new Error(`Chat history API error: ${response.status}`);
+  const data = (await response.json()) as ChatConversationSummary[];
+  return (Array.isArray(data) ? data : []).map((item) => ({
+    id: item.id,
+    title: item.title || item.question || "历史会话",
+    question: item.question || item.title || "",
+    createdAt: item.updatedAt || item.createdAt,
+    preview: item.preview || "",
+  }));
+}
+
+async function loadPersistedAssistantConversation(conversationId: string): Promise<AssistantHistoryItem | null> {
+  const response = await fetch(`${managementApiBase}/chat/conversations/${encodeURIComponent(conversationId)}`);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Chat conversation API error: ${response.status}`);
+  const detail = (await response.json()) as ChatConversationDetail;
+  const conversation = buildAssistantConversationFromChatDetail(detail);
+  return {
+    id: detail.id,
+    title: detail.title || detail.question || "历史会话",
+    question: detail.question || detail.title || "",
+    createdAt: detail.updatedAt || detail.createdAt,
+    preview: detail.preview || buildAssistantHistoryPreview(conversation),
+    conversation,
+  };
+}
+
+async function updatePersistedConversationTitle(conversationId: string, title: string) {
+  const response = await fetch(`${managementApiBase}/chat/conversations/${encodeURIComponent(conversationId)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title }),
+  });
+  if (!response.ok) throw new Error(`Chat title API error: ${response.status}`);
+}
+
+async function clearPersistedAssistantHistory() {
+  const response = await fetch(`${managementApiBase}/chat/conversations`, { method: "DELETE" });
+  if (!response.ok && response.status !== 204) throw new Error(`Clear chat history API error: ${response.status}`);
 }
 
 const knowledgeBaseDocumentService = {
@@ -1279,7 +1548,7 @@ function FeatureCard({
     <motion.div
       onMouseMove={pointer.handleMove}
       onMouseLeave={pointer.handleLeave}
-      whileHover={{ y: -10, scale: 1.025 }}
+      whileHover={{ scale: 1.025 }}
       style={{
         x: pointer.shiftX,
         y: pointer.shiftY,
@@ -1350,7 +1619,7 @@ function MetricCard({
           ? { opacity: 1, x: 0, y: 0, scale: 1, filter: "blur(0px)", transition: { duration: 0.48, delay: 0.08 * index } }
           : { opacity: 0, x: index % 2 === 0 ? -28 : 28, y: 28, scale: 0.92, filter: "blur(12px)", transition: { duration: 0.28 } }
       }
-      whileHover={{ y: -12, scale: 1.025 }}
+      whileHover={{ scale: 1.025 }}
     >
       <motion.span className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-300 group-hover:opacity-100" style={{ background: glow }} />
       <motion.div
@@ -1491,7 +1760,7 @@ function InteractiveCutPanel({
     <motion.div
       onMouseMove={pointer.handleMove}
       onMouseLeave={pointer.handleLeave}
-      whileHover={{ y: -6, scale: 1.006 }}
+      whileHover={{ scale: 1.006 }}
       style={{
         x: pointer.shiftX,
         y: pointer.shiftY,
@@ -1653,19 +1922,16 @@ function getUploadStageLabel(stage: UploadStage) {
 function handleFramePointerMove(event: React.MouseEvent<HTMLElement>) {
   const target = event.currentTarget;
   const rect = target.getBoundingClientRect();
-  const dx = event.clientX - (rect.left + rect.width / 2);
-  const dy = event.clientY - (rect.top + rect.height / 2);
-  const nx = rect.width > 0 ? Math.max(-1, Math.min(1, dx / (rect.width / 2))) : 0;
-  const ny = rect.height > 0 ? Math.max(-1, Math.min(1, dy / (rect.height / 2))) : 0;
-  const shiftX = nx * 4;
-  const shiftY = ny * 3;
-  const rotateX = -ny * 1.6;
-  const rotateY = nx * 1.6;
-  target.style.transform = `perspective(1200px) translate3d(${shiftX}px, ${shiftY}px, 0) rotateX(${rotateX}deg) rotateY(${rotateY}deg)`;
+  const pointerX = rect.width > 0 ? event.clientX - rect.left : rect.width / 2;
+  const pointerY = rect.height > 0 ? event.clientY - rect.top : rect.height / 2;
+  target.classList.add("tactical-hover-frame");
+  target.style.setProperty("--frame-pointer-x", `${pointerX}px`);
+  target.style.setProperty("--frame-pointer-y", `${pointerY}px`);
 }
 
 function handleFramePointerLeave(event: React.MouseEvent<HTMLElement>) {
-  event.currentTarget.style.transform = "";
+  event.currentTarget.style.setProperty("--frame-pointer-x", "50%");
+  event.currentTarget.style.setProperty("--frame-pointer-y", "50%");
 }
 
 function inferKnowledgeBaseIdForDocument(
@@ -1697,6 +1963,8 @@ function inferKnowledgeBaseIdForDocument(
 
   return knowledgeBases[0]?.id ?? 0;
 }
+
+void inferKnowledgeBaseIdForDocument;
 
 function ManagementFieldShell({
   accent,
@@ -1757,42 +2025,32 @@ function ManagementActionButton({
   type?: "button" | "submit";
   className?: string;
 }) {
-  const pointer = useInteractivePointer({
-    maxShiftRatio: 0.01,
-    maxShift: 2.5,
-    maxRotate: 1,
-  });
   const [hovered, setHovered] = useState(false);
   const showSurface = hoverOutlineOnly ? hovered && !disabled : true;
 
   return (
     <motion.button
       type={type}
-      whileHover={disabled ? undefined : { y: -2, scale: 1.01 }}
+      whileHover={disabled ? undefined : { scale: 1.01 }}
       whileTap={disabled ? undefined : { scale: 0.985 }}
-      onHoverStart={() => setHovered(true)}
-      onHoverEnd={() => {
+      onMouseEnter={() => setHovered(true)}
+      onMouseMove={handleFramePointerMove}
+      onMouseLeave={(event) => {
         setHovered(false);
-        pointer.handleLeave();
+        handleFramePointerLeave(event);
       }}
-      onMouseMove={pointer.handleMove}
-      onMouseLeave={pointer.handleLeave}
       onClick={onClick}
       disabled={disabled}
-      className={`group relative inline-flex h-10 items-center gap-2 overflow-hidden border px-3.5 font-display text-[9px] uppercase tracking-[0.26em] transition-[transform,border-color,background,opacity] duration-300 ${
+      className={`group tactical-hover-frame relative inline-flex h-10 items-center gap-2 overflow-hidden border px-3.5 font-display text-[9px] uppercase tracking-[0.26em] transition-[border-color,background,opacity,box-shadow] duration-300 ${
         disabled ? "cursor-not-allowed opacity-45" : ""
       } ${className}`}
       style={{
+        "--frame-accent": accent,
         borderColor: showSurface ? (secondary ? "rgba(255,255,255,0.16)" : `${accent}88`) : "transparent",
         background: showSurface ? (secondary ? "rgba(255,255,255,0.035)" : `${accent}16`) : "transparent",
         color: "#f5f7fa",
-        x: pointer.shiftX,
-        y: pointer.shiftY,
-        rotateX: pointer.rotateX,
-        rotateY: pointer.rotateY,
-        transformPerspective: 1000,
         clipPath: "polygon(0 0, calc(100% - 14px) 0, 100% 14px, 100% 100%, 0 100%)",
-      }}
+      } as CSSProperties}
     >
       <span className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-300 group-hover:opacity-100" style={{ background: `radial-gradient(circle at 18% 22%, ${accent}36 0%, transparent 68%)` }} />
       <span className="pointer-events-none absolute inset-x-3 bottom-0 h-px origin-left scale-x-0 bg-white/75 transition-transform duration-300 group-hover:scale-x-100" />
@@ -1827,7 +2085,7 @@ function ManagementEmptyState({
     <motion.div
       onMouseMove={pointer.handleMove}
       onMouseLeave={pointer.handleLeave}
-      whileHover={{ y: -4, scale: 1.01 }}
+      whileHover={{ scale: 1.01 }}
       className="flex min-h-[14rem] flex-col items-center justify-center border border-dashed border-white/12 bg-white/[0.015] px-6 py-10 text-center"
       style={{
         x: pointer.shiftX,
@@ -1909,6 +2167,11 @@ function ManagementModal({
   children: ReactNode;
 }) {
   const [mounted, setMounted] = useState(false);
+  const pointer = useInteractivePointer({
+    maxShiftRatio: 0.006,
+    maxShift: 4,
+    maxRotate: 0.9,
+  });
 
   useEffect(() => {
     setMounted(true);
@@ -1959,9 +2222,25 @@ function ManagementModal({
             exit={{ opacity: 0, y: 24, scale: 0.975, filter: "blur(8px)", transition: { duration: 0.22 } }}
             className={`relative w-full ${widthClass} max-h-[calc(100dvh-2.5rem)] overflow-y-auto`}
             onClick={(event) => event.stopPropagation()}
+            onMouseMove={(event) => {
+              pointer.handleMove(event);
+              handleFramePointerMove(event);
+            }}
+            onMouseLeave={(event) => {
+              pointer.handleLeave();
+              handleFramePointerLeave(event);
+            }}
+            style={{
+              "--frame-accent": accent,
+              x: pointer.shiftX,
+              y: pointer.shiftY,
+              rotateX: pointer.rotateX,
+              rotateY: pointer.rotateY,
+              transformPerspective: 1400,
+            } as unknown as CSSProperties}
           >
             <div
-              className="cut-panel relative overflow-hidden border border-white/10 bg-[#080a0f] p-5 shadow-[0_40px_120px_rgba(0,0,0,0.56)]"
+              className="cut-panel tactical-hover-frame relative overflow-hidden border border-white/10 bg-[#080a0f] p-5 shadow-[0_40px_120px_rgba(0,0,0,0.56)]"
               style={{ "--panel-accent": accent } as CSSProperties}
             >
               <motion.div
@@ -1971,13 +2250,18 @@ function ManagementModal({
                 transition={{ duration: 0.45, delay: 0.08 }}
                 style={{ background: `linear-gradient(90deg, transparent, ${accent}, transparent)` }}
               />
-              <button
+              <motion.button
                 type="button"
                 onClick={onClose}
-                className="absolute right-5 top-5 flex h-10 w-10 items-center justify-center border border-white/10 bg-white/[0.03] text-white/68 transition-colors duration-300 hover:border-white/20 hover:text-white"
+                whileHover={{ scale: 1.045 }}
+                whileTap={{ scale: 0.96 }}
+                onMouseMove={handleFramePointerMove}
+                onMouseLeave={handleFramePointerLeave}
+                className="tactical-hover-frame absolute right-5 top-5 flex h-10 w-10 items-center justify-center border border-white/10 bg-white/[0.03] text-white/68 transition-colors duration-300 hover:border-white/20 hover:text-white"
+                style={{ "--frame-accent": accent } as CSSProperties}
               >
                 <X size={16} />
-              </button>
+              </motion.button>
               <div className="mb-5 pr-12">
                 <div className="text-[10px] uppercase tracking-[0.34em] text-white/38">{kicker}</div>
                 <div className="mt-2 font-display text-2xl uppercase tracking-[0.16em] text-white">{title}</div>
@@ -2054,7 +2338,7 @@ function CitationTag({
   return (
     <motion.button
       type="button"
-      whileHover={{ y: -3, scale: 1.035 }}
+      whileHover={{ scale: 1.035 }}
       whileTap={{ scale: 0.985 }}
       onClick={onClick}
       className={`group relative inline-flex items-center gap-2 overflow-hidden border px-2.5 py-1 text-[10px] uppercase tracking-[0.24em] transition-[border-color,background,transform,color,box-shadow] duration-250 ${
@@ -2195,7 +2479,7 @@ function AssistantAnswerCard({
       animate={{ opacity: 1, y: 0, transition: { duration: 0.42, delay: 0.06 * index } }}
       onMouseMove={pointer.handleMove}
       onMouseLeave={pointer.handleLeave}
-      whileHover={{ y: -5, scale: 1.006 }}
+      whileHover={{ scale: 1.006 }}
       style={{
         x: pointer.shiftX,
         y: pointer.shiftY,
@@ -2408,10 +2692,17 @@ function AssistantHistoryRow({
 
   return (
     <motion.div
-      onMouseMove={pointer.handleMove}
-      onMouseLeave={pointer.handleLeave}
-      whileHover={active ? { y: -2.5, scale: 1.012 } : { x: 4, y: -1 }}
+      onMouseMove={(event) => {
+        pointer.handleMove(event);
+        handleFramePointerMove(event);
+      }}
+      onMouseLeave={(event) => {
+        pointer.handleLeave();
+        handleFramePointerLeave(event);
+      }}
+      whileHover={{ scale: active ? 1.012 : 1.006 }}
       style={{
+        "--frame-accent": active ? chapter.secondary : chapter.accent,
         x: pointer.shiftX,
         y: pointer.shiftY,
         rotateX: pointer.rotateX,
@@ -2425,8 +2716,8 @@ function AssistantHistoryRow({
           ? `0 0 0 1px ${chapter.secondary}20, 0 0 16px ${chapter.secondary}12, 0 0 28px ${chapter.accent}10, inset 0 0 0 1px rgba(255,255,255,0.04)`
           : undefined,
         clipPath: "polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 0 100%)",
-      }}
-      className={`group relative overflow-hidden border transition-[border-color,background-color,box-shadow] duration-220 ${
+      } as unknown as CSSProperties}
+      className={`group tactical-hover-frame relative overflow-hidden border transition-[border-color,background-color,box-shadow] duration-220 ${
         active ? "" : "hover:bg-white/[0.024]"
       }`}
     >
@@ -2718,6 +3009,8 @@ function AssistantLaunchOverlay({
   );
 }
 
+void AssistantLaunchOverlay;
+
 function PdfPreviewPane({
   source,
   citation,
@@ -2729,6 +3022,27 @@ function PdfPreviewPane({
   pageNumber: number;
   onPageChange: (pageNumber: number) => void;
 }) {
+  const [imageFailed, setImageFailed] = useState(false);
+
+  const matchedPage = source?.pages.find((page) => page.pageNumber === pageNumber);
+  const fallbackPage = source?.pages[0];
+  const currentPage = matchedPage ??
+    (source
+      ? {
+          pageNumber,
+          sectionTitle: citation?.evidenceLocation.chapter || fallbackPage?.sectionTitle || source.chapter,
+          lines: pageNumber === fallbackPage?.pageNumber ? fallbackPage.lines : [],
+          previewImageUrl: source.previewImageTemplate?.replace("__PAGE__", String(pageNumber)),
+        }
+      : null);
+  const previewImageUrl = source
+    ? source.previewImageTemplate?.replace("__PAGE__", String(pageNumber)) ?? currentPage?.previewImageUrl
+    : undefined;
+
+  useEffect(() => {
+    setImageFailed(false);
+  }, [previewImageUrl]);
+
   if (!source) {
     return (
       <div className="flex min-h-[20rem] items-center justify-center border border-white/8 bg-white/[0.02] px-4">
@@ -2740,21 +3054,39 @@ function PdfPreviewPane({
     );
   }
 
-  const currentPage = source.pages.find((page) => page.pageNumber === pageNumber) ?? source.pages[0];
-  const currentIndex = source.pages.findIndex((page) => page.pageNumber === currentPage.pageNumber);
-  const hasPrev = currentIndex > 0;
-  const hasNext = currentIndex < source.pages.length - 1;
-  const activeHighlight = citation && citation.page === currentPage.pageNumber ? citation.highlightText : "";
+  const resolvedCurrentPage = currentPage ?? source.pages[0];
+  const currentIndex = source.pages.findIndex((page) => page.pageNumber === resolvedCurrentPage.pageNumber);
+  const dynamicPreview = Boolean(source.previewImageTemplate);
+  const hasPrev = dynamicPreview ? pageNumber > 1 : currentIndex > 0;
+  const hasNext = dynamicPreview ? pageNumber < source.pageCount : currentIndex >= 0 && currentIndex < source.pages.length - 1;
+  const activeHighlight = citation && citation.page === resolvedCurrentPage.pageNumber ? citation.highlightText : "";
+  const activeBbox = citation && citation.page === pageNumber ? citation.evidenceLocation.bbox : undefined;
+  const fallbackLines =
+    resolvedCurrentPage.lines.length > 0
+      ? resolvedCurrentPage.lines
+      : [citation?.quotedText || source.snippet || "当前页没有可用的文本回退内容。"];
+
+  const handlePrev = () => {
+    if (!hasPrev) return;
+    onPageChange(dynamicPreview ? pageNumber - 1 : source.pages[Math.max(currentIndex - 1, 0)].pageNumber);
+  };
+
+  const handleNext = () => {
+    if (!hasNext) return;
+    onPageChange(dynamicPreview ? pageNumber + 1 : source.pages[Math.min(currentIndex + 1, source.pages.length - 1)].pageNumber);
+  };
 
   return (
     <div className="grid gap-3">
       <div className="paper-shell relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-[1.8rem] px-6 py-6 text-[#17181b]">
         <div className="relative z-10 grid gap-4 md:grid-cols-[minmax(0,1fr)_auto] md:items-start">
           <div className="min-w-0">
-            <div className="text-[10px] uppercase tracking-[0.28em] text-[#5c5d61]/70">模拟 PDF 预览</div>
+            <div className="text-[10px] uppercase tracking-[0.28em] text-[#5c5d61]/70">
+              {previewImageUrl && !imageFailed ? "真实 PDF 预览" : "证据文本预览"}
+            </div>
             <div className="text-[10px] uppercase tracking-[0.28em] text-[#5c5d61]/70">{source.documentType}</div>
             <div className="mt-2 text-xl font-semibold">{source.documentTitle}</div>
-            <div className="mt-2 text-sm text-[#57585c]">{currentPage.sectionTitle}</div>
+            <div className="mt-2 text-sm text-[#57585c]">{resolvedCurrentPage.sectionTitle}</div>
           </div>
           <div className="grid gap-3 md:justify-items-end">
             <div className="text-left md:text-right">
@@ -2764,26 +3096,56 @@ function PdfPreviewPane({
           </div>
         </div>
         <div className="relative z-10 mt-6 flex-1">
-          <div className="grid gap-3 text-[14px] leading-7 text-[#232427]">
-          {currentPage.lines.map((line, index) => (
-            <div key={`${currentPage.pageNumber}-${index}`}>{renderHighlightedPreviewLine(line, activeHighlight)}</div>
-          ))}
-          </div>
+          {previewImageUrl && !imageFailed ? (
+            <div className="relative min-h-[28rem] overflow-hidden rounded-[1.25rem] border border-black/10 bg-[#f7f1e6]/90 shadow-[0_18px_40px_rgba(0,0,0,0.08)]">
+              <img
+                src={previewImageUrl}
+                alt={`${source.documentTitle} 第 ${pageNumber} 页`}
+                className="block w-full select-none bg-white"
+                draggable={false}
+                onError={() => setImageFailed(true)}
+              />
+              {activeBbox ? (
+                <span
+                  className="pointer-events-none absolute border border-[#ffe26a]/90 bg-[#fff17b]/22 shadow-[0_0_24px_rgba(255,226,106,0.3)]"
+                  style={{
+                    left: `${activeBbox.x * 100}%`,
+                    top: `${activeBbox.y * 100}%`,
+                    width: `${activeBbox.width * 100}%`,
+                    height: `${activeBbox.height * 100}%`,
+                  }}
+                />
+              ) : null}
+            </div>
+          ) : (
+            <div className="grid gap-3 text-[14px] leading-7 text-[#232427]">
+              {fallbackLines.map((line, index) => (
+                <div key={`${resolvedCurrentPage.pageNumber}-${index}`} className="break-words whitespace-pre-wrap">
+                  {renderHighlightedPreviewLine(line, activeHighlight)}
+                </div>
+              ))}
+              {previewImageUrl && imageFailed ? (
+                <div className="rounded-md border border-[#17181b]/10 bg-black/[0.04] px-3 py-2 text-[12px] text-[#5b5d61]">
+                  原始 PDF 页图加载失败，已切换到文本预览。
+                </div>
+              ) : null}
+            </div>
+          )}
         </div>
         <div className="relative z-10 mt-8 flex flex-wrap items-center justify-between gap-3 border-t border-black/10 pt-4">
           <div>
             <div className="text-[10px] uppercase tracking-[0.28em] text-[#66686d]/70">页码</div>
             <div className="mt-1 font-display text-sm uppercase tracking-[0.14em] text-[#3f4248]">
-              第 {currentPage.pageNumber} 页 / 共 {source.pageCount} 页
+              第 {pageNumber} 页 / 共 {source.pageCount} 页
             </div>
           </div>
           <div className="flex flex-wrap gap-2 md:justify-end">
             <motion.button
               type="button"
-              whileHover={hasPrev ? { y: -2, scale: 1.01 } : undefined}
+              whileHover={hasPrev ? { scale: 1.01 } : undefined}
               whileTap={hasPrev ? { scale: 0.985 } : undefined}
               disabled={!hasPrev}
-              onClick={() => hasPrev && onPageChange(source.pages[currentIndex - 1].pageNumber)}
+              onClick={handlePrev}
               className={`inline-flex h-9 items-center gap-2 overflow-hidden border px-3 font-display text-[9px] uppercase tracking-[0.22em] transition-[transform,border-color,background,opacity] duration-300 ${
                 hasPrev ? "" : "cursor-not-allowed opacity-35"
               }`}
@@ -2809,10 +3171,10 @@ function PdfPreviewPane({
             </motion.button>
             <motion.button
               type="button"
-              whileHover={hasNext ? { y: -2, scale: 1.01 } : undefined}
+              whileHover={hasNext ? { scale: 1.01 } : undefined}
               whileTap={hasNext ? { scale: 0.985 } : undefined}
               disabled={!hasNext}
-              onClick={() => hasNext && onPageChange(source.pages[currentIndex + 1].pageNumber)}
+              onClick={handleNext}
               className={`inline-flex h-9 items-center gap-2 overflow-hidden border px-3 font-display text-[9px] uppercase tracking-[0.22em] transition-[transform,border-color,background,opacity] duration-300 ${
                 hasNext ? "" : "cursor-not-allowed opacity-35"
               }`}
@@ -2915,7 +3277,7 @@ function SketchDocCard({
     <motion.div
       onMouseMove={pointer.handleMove}
       onMouseLeave={pointer.handleLeave}
-      whileHover={{ y: -6, scale: 1.008 }}
+      whileHover={{ scale: 1.008 }}
       initial={{ opacity: 0, y: 28, scale: 0.97 }}
       animate={{ opacity: 1, y: 0, scale: 1, transition: { duration: 0.55, delay, ease: [0.16, 1, 0.3, 1] } }}
       className="group relative overflow-hidden border border-white/10 bg-white/[0.012] px-4 py-3.5 md:px-4 md:py-3.5"
@@ -2973,6 +3335,70 @@ function SketchDocCard({
   );
 }
 
+function SketchHistoryCard({
+  chapter,
+  item,
+  delay = 0,
+  onOpen,
+}: {
+  chapter: Chapter;
+  item: AssistantHistoryItem;
+  delay?: number;
+  onOpen: () => void;
+}) {
+  const pointer = useInteractivePointer({
+    maxShiftRatio: 0.008,
+    maxShift: 3.5,
+    maxRotate: 0.8,
+  });
+  const glow = useMotionTemplate`radial-gradient(210px circle at ${pointer.glowX}px ${pointer.glowY}px, ${chapter.secondary}26 0%, transparent 74%)`;
+
+  return (
+    <motion.button
+      type="button"
+      onClick={onOpen}
+      onMouseMove={(event) => {
+        pointer.handleMove(event);
+        handleFramePointerMove(event);
+      }}
+      onMouseLeave={(event) => {
+        pointer.handleLeave();
+        handleFramePointerLeave(event);
+      }}
+      whileHover={{ scale: 1.008 }}
+      whileTap={{ scale: 0.988 }}
+      initial={{ opacity: 0, y: 24, scale: 0.97 }}
+      animate={{ opacity: 1, y: 0, scale: 1, transition: { duration: 0.48, delay, ease: [0.16, 1, 0.3, 1] } }}
+      className="tactical-hover-frame group relative overflow-hidden border border-white/10 bg-white/[0.012] px-4 py-3.5 text-left"
+      style={{
+        "--frame-accent": chapter.secondary,
+        x: pointer.shiftX,
+        y: pointer.shiftY,
+        rotateX: pointer.rotateX,
+        rotateY: pointer.rotateY,
+        transformPerspective: 1400,
+        clipPath: "polygon(0 0, 100% 0, 100% calc(100% - 16px), calc(100% - 16px) 100%, 0 100%)",
+      } as unknown as CSSProperties}
+    >
+      <motion.span className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-300 group-hover:opacity-100" style={{ background: glow }} />
+      <div className="relative z-10 grid gap-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-[10px] uppercase tracking-[0.28em] text-white/35">Assistant Trace</div>
+            <div className="mt-2 line-clamp-2 text-[0.98rem] font-medium leading-6 text-white">{item.title || item.question}</div>
+          </div>
+          <TacticalTag accent={chapter.secondary}>{formatAssistantHistoryTime(item.createdAt)}</TacticalTag>
+        </div>
+        <div className="line-clamp-3 text-[12px] leading-6 text-white/55">{item.preview || item.question || "继续打开这段航空文档问答上下文。"}</div>
+        <div className="flex items-center justify-between border-t border-white/[0.05] pt-3">
+          <span className="text-[10px] uppercase tracking-[0.24em] text-white/34">Open Chat</span>
+          <ArrowRight size={14} color={chapter.secondary} />
+        </div>
+      </div>
+    </motion.button>
+  );
+}
+
 function SketchSection({
   title,
   subtitle,
@@ -2994,8 +3420,24 @@ function SketchSection({
   delay?: number;
   children: ReactNode;
 }) {
+  const pointer = useInteractivePointer({
+    maxShiftRatio: 0.006,
+    maxShift: 5,
+    maxRotate: 0.8,
+  });
+  const glow = useMotionTemplate`radial-gradient(280px circle at ${pointer.glowX}px ${pointer.glowY}px, ${accent}24 0%, transparent 74%)`;
+
   return (
     <motion.section
+      onMouseMove={(event) => {
+        pointer.handleMove(event);
+        handleFramePointerMove(event);
+      }}
+      onMouseLeave={(event) => {
+        pointer.handleLeave();
+        handleFramePointerLeave(event);
+      }}
+      whileHover={{ scale: 1.002 }}
       initial={{ opacity: 0, y: 34, scale: 0.985 }}
       animate={{
         opacity: 1,
@@ -3003,9 +3445,18 @@ function SketchSection({
         scale: 1,
         transition: { duration: 0.75, delay, ease: [0.16, 1, 0.3, 1] },
       }}
-      style={{ "--panel-accent": accent } as CSSProperties}
-      className="cut-panel sketch-section-panel relative flex h-full min-h-0 flex-col overflow-hidden border border-white/[0.14] bg-white/[0.018] p-4 shadow-panel md:p-5"
+      style={{
+        "--panel-accent": accent,
+        "--frame-accent": accent,
+        x: pointer.shiftX,
+        y: pointer.shiftY,
+        rotateX: pointer.rotateX,
+        rotateY: pointer.rotateY,
+        transformPerspective: 1500,
+      } as unknown as CSSProperties}
+      className="cut-panel sketch-section-panel tactical-hover-frame group relative flex h-full min-h-0 flex-col overflow-hidden border border-white/[0.14] bg-white/[0.018] p-4 shadow-panel md:p-5"
     >
+      <motion.span className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-300 group-hover:opacity-100" style={{ background: glow }} />
       <div className="pointer-events-none absolute inset-x-4 top-4 flex items-center gap-3 opacity-75 md:inset-x-5">
         <span className="h-px w-16 bg-white/[0.1]" />
         <span className="h-px flex-1 bg-white/[0.045]" />
@@ -3170,12 +3621,12 @@ function UploadBay({ chapter, onFileSelect }: { chapter: Chapter; onFileSelect?:
   return (
     <motion.div
       onMouseMove={pointer.handleMove}
-      onMouseLeave={(e) => { pointer.handleLeave(e); setDragOver(false); }}
+      onMouseLeave={() => { pointer.handleLeave(); setDragOver(false); }}
       onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
       onDragLeave={() => setDragOver(false)}
       onDrop={(e) => { e.preventDefault(); setDragOver(false); handleFile(e.dataTransfer.files[0]); }}
       onClick={() => fileInputRef.current?.click()}
-      whileHover={{ y: -8, scale: 1.008 }}
+      whileHover={{ scale: 1.008 }}
       style={{
         x: pointer.shiftX,
         y: pointer.shiftY,
@@ -3434,7 +3885,7 @@ function HomePage({
             <motion.button
               ref={advantageButtonRef}
               onClick={scrollToAdvantage}
-              whileHover={{ x: 6 }}
+              whileHover={{ scale: 1.015 }}
               whileTap={{ scale: 0.985 }}
               className="group mt-auto inline-flex items-center gap-3 border-0 bg-transparent p-0 pt-6 text-left"
               initial={{ opacity: 0, y: 20 }}
@@ -3584,7 +4035,7 @@ function HomePage({
                     initial={{ opacity: 0, x: index % 2 === 0 ? -24 : 24, y: 16, scale: 0.95, filter: "blur(12px)" }}
                     reveal={{ opacity: 1, x: 0, y: 0, scale: 1, filter: "blur(0px)" }}
                     transition={{ delay: 0.08 * index }}
-                    whileHover={{ y: -6, scale: 1.015, borderColor: `${chapter.accent}55` }}
+                    whileHover={{ scale: 1.015, borderColor: `${chapter.accent}55` }}
                     amount={0.18}
                   >
                     <div className="font-display text-base uppercase tracking-[0.14em] text-white">{item.title}</div>
@@ -3618,7 +4069,7 @@ function InteractivePreviewInfoCard({
     <motion.div
       onMouseMove={pointer.handleMove}
       onMouseLeave={pointer.handleLeave}
-      whileHover={{ y: -4, scale: 1.015 }}
+      whileHover={{ scale: 1.015 }}
       style={{
         x: pointer.shiftX,
         y: pointer.shiftY,
@@ -3638,6 +4089,8 @@ function InteractivePreviewInfoCard({
     </motion.div>
   );
 }
+
+void InteractivePreviewInfoCard;
 function IntakePage({
   chapter,
   goSystem,
@@ -4791,7 +5244,7 @@ function RetrievalPage({ chapter }: { chapter: Chapter }) {
               {["ATA 章节编号匹配", "故障码精确命中", "缩略语扩展召回", "航空术语词典增强"].map((item) => (
                 <motion.div
                   key={item}
-                  whileHover={{ x: 8, scale: 1.015, borderColor: `${chapter.accent}55` }}
+                  whileHover={{ scale: 1.015, borderColor: `${chapter.accent}55` }}
                   className="border border-white/8 bg-white/[0.006] px-4 py-3"
                 >
                   <div className="flex items-center justify-between text-sm text-white/75">
@@ -4855,7 +5308,7 @@ function RetrievalPage({ chapter }: { chapter: Chapter }) {
               {["BGE-M3 / m3e 嵌入选型", "段落级语义相似度", "相邻 chunk 连贯修复", "跨文档关联分析"].map((item) => (
                 <motion.div
                   key={item}
-                  whileHover={{ x: 8, scale: 1.015, borderColor: `${chapter.secondary}55` }}
+                  whileHover={{ scale: 1.015, borderColor: `${chapter.secondary}55` }}
                   className="border border-white/8 bg-white/[0.006] px-4 py-3"
                 >
                   <div className="flex items-center justify-between text-sm text-white/75">
@@ -4880,7 +5333,7 @@ function RetrievalPage({ chapter }: { chapter: Chapter }) {
                 style={{ clipPath: "polygon(0 0, 100% 0, 100% calc(100% - 16px), calc(100% - 16px) 100%, 0 100%)" }}
                 initial={{ opacity: 0, y: 18 }}
                 animate={{ opacity: 1, y: 0, transition: { duration: 0.4, delay: 0.08 * index } }}
-                whileHover={{ y: -5, scale: 1.01, borderColor: `${chapter.accent}55` }}
+                whileHover={{ scale: 1.01, borderColor: `${chapter.accent}55` }}
               >
                 <div>
                   <div className="font-display text-sm uppercase tracking-[0.18em]" style={{ color: chapter.accent }}>
@@ -4905,7 +5358,7 @@ function RetrievalPage({ chapter }: { chapter: Chapter }) {
                   key={result.label}
                   initial={{ opacity: 0, y: 20 }}
                   animate={{ opacity: 1, y: 0, transition: { duration: 0.4, delay: 0.1 * index } }}
-                  whileHover={{ y: -5, scale: 1.012, borderColor: `${chapter.secondary}55` }}
+                  whileHover={{ scale: 1.012, borderColor: `${chapter.secondary}55` }}
                   className="border border-white/8 bg-white/[0.008] px-4 py-4"
                   style={{ clipPath: "polygon(0 0, 100% 0, 100% calc(100% - 16px), calc(100% - 16px) 100%, 0 100%)" }}
                 >
@@ -4928,7 +5381,7 @@ function RetrievalPage({ chapter }: { chapter: Chapter }) {
                   className="border border-white/8 bg-white/[0.008] px-4 py-4"
                   initial={{ opacity: 0, y: 18 }}
                   animate={{ opacity: 1, y: 0, transition: { delay: 0.1 * index } }}
-                  whileHover={{ x: 6, scale: 1.01, borderColor: `${chapter.accent}55` }}
+                  whileHover={{ scale: 1.01, borderColor: `${chapter.accent}55` }}
                 >
                   <div className="flex items-start justify-between gap-4">
                     <div>
@@ -4983,6 +5436,20 @@ function AviationAssistantPage({
   }, []);
 
   useEffect(() => {
+    let active = true;
+    void listPersistedAssistantHistory()
+      .then((items) => {
+        if (active) setHistoryItems(items);
+      })
+      .catch((error) => {
+        console.warn("Failed to load persisted assistant history.", error);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
     const scrollNode = chatScrollRef.current;
     if (!scrollNode) return;
 
@@ -5025,15 +5492,33 @@ function AviationAssistantPage({
     return filtered;
   }, [conversation, filteredSourceIds, selectedCitation]);
 
+  const resolveCitationPreviewPage = (
+    citation: AssistantCitation | null | undefined,
+    source: AssistantSource | null | undefined,
+  ) => {
+    const sourcePages = source?.pages ?? [];
+    if (citation) {
+      const matchedPage = sourcePages.find((page) => page.pageNumber === citation.page);
+      if (matchedPage) return matchedPage.pageNumber;
+    }
+
+    if (sourcePages.length > 0) {
+      return sourcePages[0].pageNumber;
+    }
+
+    return citation?.page ?? 1;
+  };
+
   const hydrateConversation = (nextConversation: AssistantConversation) => {
     const defaultCitation =
       nextConversation.citations.find((citation) => citation.id === nextConversation.defaultCitationId) ??
       nextConversation.citations[0] ??
       null;
+    const defaultSource = defaultCitation ? nextConversation.sources.find((source) => source.id === defaultCitation.sourceId) ?? null : null;
 
     setConversation(nextConversation);
     setSelectedCitationId(defaultCitation?.id ?? null);
-    setPreviewPage(defaultCitation?.page ?? 1);
+    setPreviewPage(resolveCitationPreviewPage(defaultCitation, defaultSource));
     setEvidenceMode("active");
     setEvidencePanelOpen(false);
   };
@@ -5046,39 +5531,49 @@ function AviationAssistantPage({
     setDraft("");
     setLoading(true);
 
-    // 先显示用户消息（loading 状态）
-    const pendingConversation: AssistantConversation = {
-      id: `pending-${Date.now()}`,
-      quickPrompt: trimmedQuestion,
-      userQuestion: trimmedQuestion,
-      aircraftModel: "ALL",
-      documentTypeFocus: "ALL",
-      defaultCitationId: "",
-      messages: [{ id: `pending-user`, role: "user", content: trimmedQuestion }],
-      citations: [],
-      sources: [],
-    };
+    const baseConversation = conversation;
+    const pendingConversation: AssistantConversation = baseConversation
+      ? {
+          ...baseConversation,
+          userQuestion: trimmedQuestion,
+          messages: [
+            ...baseConversation.messages,
+            { id: `pending-user-${Date.now()}`, role: "user", content: trimmedQuestion },
+          ],
+        }
+      : {
+          id: `pending-${Date.now()}`,
+          quickPrompt: trimmedQuestion,
+          userQuestion: trimmedQuestion,
+          aircraftModel: "ALL",
+          documentTypeFocus: "ALL",
+          defaultCitationId: "",
+          messages: [{ id: `pending-user`, role: "user", content: trimmedQuestion }],
+          citations: [],
+          sources: [],
+        };
     setConversation(pendingConversation);
 
     try {
       // 调用真实 API，失败则 fallback 到 mock
-      const apiConversation = await callQAApi(trimmedQuestion);
-      const resolvedConversation = apiConversation ?? resolveAssistantConversation(trimmedQuestion);
+      const apiConversation = await callEvidenceAwareQAApi(trimmedQuestion, baseConversation?.id, baseConversation);
+      const resolvedConversation = apiConversation ?? createServiceUnavailableConversation(trimmedQuestion, baseConversation);
+      const isPersistedConversation = Boolean(apiConversation);
 
       const createdAt = Date.now();
       const historyEntry: AssistantHistoryItem = {
-        id: `${resolvedConversation.id}-${createdAt}`,
+        id: resolvedConversation.id,
         title: trimmedQuestion,
         question: trimmedQuestion,
         createdAt,
         preview: buildAssistantHistoryPreview(resolvedConversation),
-        conversation: cloneAssistantConversation(resolvedConversation, trimmedQuestion),
+        conversation: resolvedConversation,
       };
 
       hydrateConversation(resolvedConversation);
       setHistoryItems((current) => [
         historyEntry,
-        ...current.filter((item) => item.question !== trimmedQuestion).slice(0, 19),
+        ...current.filter((item) => item.id !== historyEntry.id).slice(0, 19),
       ]);
       setActiveHistoryId(historyEntry.id);
       setDocumentTypeFilter(resolvedConversation.documentTypeFocus);
@@ -5086,6 +5581,8 @@ function AviationAssistantPage({
 
       // 异步生成对话标题（不阻塞 UI）
       const answerText = resolvedConversation.messages
+        .slice()
+        .reverse()
         .find((m) => m.role === "assistant")
         ?.segments?.map((s) => s.text)
         .join(" ") ?? "";
@@ -5093,26 +5590,42 @@ function AviationAssistantPage({
         setHistoryItems((current) =>
           current.map((h) => (h.id === historyEntry.id ? { ...h, title } : h)),
         );
+        if (isPersistedConversation) {
+          void updatePersistedConversationTitle(historyEntry.id, title).catch(() => undefined);
+        }
       });
     } finally {
       setLoading(false);
     }
   };
 
-  const handleRestoreHistory = (item: AssistantHistoryItem) => {
-    hydrateConversation(cloneAssistantConversation(item.conversation, item.question));
-    setDocumentTypeFilter(item.conversation.documentTypeFocus);
-    setAircraftModelFilter(item.conversation.aircraftModel);
+  const handleRestoreHistory = async (item: AssistantHistoryItem) => {
     setActiveHistoryId(item.id);
     setDraft("");
+
+    try {
+      const hydratedItem = item.conversation ? item : await loadPersistedAssistantConversation(item.id);
+      const nextConversation = hydratedItem?.conversation;
+      if (!nextConversation) return;
+
+      hydrateConversation(nextConversation);
+      setDocumentTypeFilter(nextConversation.documentTypeFocus);
+      setAircraftModelFilter(nextConversation.aircraftModel);
+      setHistoryItems((current) =>
+        current.map((historyItem) => (historyItem.id === item.id ? { ...historyItem, ...hydratedItem, conversation: nextConversation } : historyItem)),
+      );
+    } catch (error) {
+      console.warn("Failed to restore persisted assistant conversation.", error);
+    }
   };
 
   const handleCitationClick = (citationId: string) => {
     const nextCitation = citationsById.get(citationId);
     if (!nextCitation) return;
+    const nextSource = sourcesById.get(nextCitation.sourceId) ?? null;
 
     setSelectedCitationId(citationId);
-    setPreviewPage(nextCitation.page);
+    setPreviewPage(resolveCitationPreviewPage(nextCitation, nextSource));
     setEvidenceMode("active");
     setEvidencePanelOpen(true);
   };
@@ -5123,8 +5636,9 @@ function AviationAssistantPage({
     if (!selectedCitationId) {
       const fallbackCitation = conversation.citations[0] ?? null;
       if (fallbackCitation) {
+        const fallbackSource = conversation.sources.find((source) => source.id === fallbackCitation.sourceId) ?? null;
         setSelectedCitationId(fallbackCitation.id);
-        setPreviewPage(fallbackCitation.page);
+        setPreviewPage(resolveCitationPreviewPage(fallbackCitation, fallbackSource));
       }
     }
 
@@ -5201,6 +5715,7 @@ function AviationAssistantPage({
                   setHistoryItems([]);
                   setDocumentTypeFilter("ALL");
                   setAircraftModelFilter("ALL");
+                  void clearPersistedAssistantHistory().catch(() => undefined);
                 }}
                 className="h-8 w-full justify-start px-3 text-[8px] tracking-[0.22em]"
               >
@@ -5298,8 +5813,8 @@ function AviationAssistantPage({
           {!isDrawerMode && evidencePanelOpen ? (
             <motion.div
               key="assistant-evidence-docked"
-              initial={{ opacity: 0, x: 36, filter: "blur(12px)" }}
-              animate={{ opacity: 1, x: 0, filter: "blur(0px)", transition: { duration: 0.42, ease: [0.16, 1, 0.3, 1] } }}
+              initial={{ opacity: 0, x: 24 }}
+              animate={{ opacity: 1, x: 0, transition: { duration: 0.28, ease: [0.16, 1, 0.3, 1] } }}
               exit={{ opacity: 0, transition: { duration: 0.001 } }}
               className="min-w-0 min-h-0 border-l border-white/[0.08] pl-0.5"
             >
@@ -5313,16 +5828,16 @@ function AviationAssistantPage({
         {isDrawerMode && evidencePanelOpen ? (
           <motion.div
             key="assistant-evidence-drawer"
-            className="fixed inset-0 z-[70] bg-black/70 px-3 py-3 backdrop-blur-sm"
+            className="fixed inset-0 z-[70] bg-black/78 px-3 py-3"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0, transition: { duration: 0.2 } }}
             onClick={() => setEvidencePanelOpen(false)}
           >
             <motion.div
-              initial={{ opacity: 0, x: 36, filter: "blur(10px)" }}
-              animate={{ opacity: 1, x: 0, filter: "blur(0px)", transition: { duration: 0.36, ease: [0.16, 1, 0.3, 1] } }}
-              exit={{ opacity: 0, x: 36, filter: "blur(8px)", transition: { duration: 0.18 } }}
+              initial={{ opacity: 0, x: 24 }}
+              animate={{ opacity: 1, x: 0, transition: { duration: 0.24, ease: [0.16, 1, 0.3, 1] } }}
+              exit={{ opacity: 0, x: 18, transition: { duration: 0.16 } }}
               className="ml-auto h-full w-full max-w-[42rem]"
               onClick={(event) => event.stopPropagation()}
             >
@@ -5390,6 +5905,7 @@ function DonutChart({ data, size = 140, strokeWidth = 18 }: { data: { label: str
 function RagPage({ chapter, onAssistantLaunch, onUpload }: { chapter: Chapter; onAssistantLaunch: (rect: DOMRect | null) => void; onUpload: () => void }) {
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBaseRecord[]>([]);
+  const [recentHistory, setRecentHistory] = useState<AssistantHistoryItem[]>([]);
 
   useEffect(() => {
     let active = true;
@@ -5402,6 +5918,18 @@ function RagPage({ chapter, onAssistantLaunch, onUpload }: { chapter: Chapter; o
       setKnowledgeBases(kbs);
     });
     return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void listPersistedAssistantHistory()
+      .then((items) => {
+        if (active) setRecentHistory(items.slice(0, 4));
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
   }, []);
 
   const latestDocs = useMemo(() => {
@@ -5528,17 +6056,35 @@ function RagPage({ chapter, onAssistantLaunch, onUpload }: { chapter: Chapter; o
             signal="History Recall"
             delay={0.08}
           >
-            <motion.div
-              initial={{ opacity: 0, y: 12 }}
-              animate={{ opacity: 1, y: 0, transition: { duration: 0.4, delay: 0.2 } }}
-              className="flex flex-col items-center justify-center py-16 text-center"
-            >
-              <div className="flex h-14 w-14 items-center justify-center border border-white/10 bg-white/[0.03]" style={{ color: chapter.secondary }}>
-                <Eye size={22} />
+            {recentHistory.length === 0 ? (
+              <motion.div
+                initial={{ opacity: 0, y: 12 }}
+                animate={{ opacity: 1, y: 0, transition: { duration: 0.4, delay: 0.2 } }}
+                onMouseMove={handleFramePointerMove}
+                onMouseLeave={handleFramePointerLeave}
+                whileHover={{ scale: 1.006 }}
+                className="tactical-hover-frame flex flex-col items-center justify-center py-16 text-center"
+                style={{ "--frame-accent": chapter.secondary } as CSSProperties}
+              >
+                <div className="flex h-14 w-14 items-center justify-center border border-white/10 bg-white/[0.03]" style={{ color: chapter.secondary }}>
+                  <Eye size={22} />
+                </div>
+                <div className="mt-4 font-display text-base uppercase tracking-[0.14em] text-white/60">暂无浏览记录</div>
+                <div className="mt-2 max-w-xs text-[12px] leading-5 text-white/36">使用智能问答检索后，浏览记录将自动出现在此处。</div>
+              </motion.div>
+            ) : (
+              <div className="grid content-start gap-3">
+                {recentHistory.map((item, index) => (
+                  <SketchHistoryCard
+                    key={item.id}
+                    chapter={chapter}
+                    item={item}
+                    delay={0.08 * index}
+                    onOpen={() => onAssistantLaunch(null)}
+                  />
+                ))}
               </div>
-              <div className="mt-4 font-display text-base uppercase tracking-[0.14em] text-white/60">暂无浏览记录</div>
-              <div className="mt-2 max-w-xs text-[12px] leading-5 text-white/36">使用智能问答检索后，浏览记录将自动出现在此处。</div>
-            </motion.div>
+            )}
           </SketchSection>
           <SketchSection
             title="分布情况"
@@ -5749,7 +6295,7 @@ export default function App() {
               height: 64,
             }}
             transition={headerMorphTransition}
-            whileHover={{ y: -4, scale: 1.035 }}
+            whileHover={{ scale: 1.035 }}
             whileTap={{ scale: 0.98 }}
             className={`group relative flex shrink-0 items-center justify-center overflow-hidden border font-display tracking-[0.3em] transition-[border-color,box-shadow,background] duration-300 ${
               enteredSystem ? "cursor-pointer" : "cursor-default"
@@ -5928,4 +6474,3 @@ export default function App() {
     </div>
   );
 }
-

@@ -30,6 +30,7 @@ export type AssistantSourcePage = {
   pageNumber: number;
   sectionTitle: string;
   lines: string[];
+  previewImageUrl?: string;
 };
 
 export type AssistantSource = {
@@ -41,6 +42,8 @@ export type AssistantSource = {
   pageCount: number;
   snippet: string;
   pages: AssistantSourcePage[];
+  previewMode?: "image" | "text";
+  previewImageTemplate?: string;
 };
 
 export type AssistantMessageSegment = {
@@ -819,9 +822,12 @@ export function cloneAssistantConversation(seed: AssistantConversation, question
     })),
     sources: seed.sources.map((source) => ({
       ...source,
+      previewMode: source.previewMode,
+      previewImageTemplate: source.previewImageTemplate,
       pages: source.pages.map((page) => ({
         ...page,
         lines: [...page.lines],
+        previewImageUrl: page.previewImageUrl,
       })),
     })),
   };

@@ -1,15 +1,23 @@
 # aerospace_api.py —— FastAPI 服务，统一对接前端
+import io
+import logging
 import os
 import re
+import sqlite3
 import sys
+import threading
 import time
 import json
+import uuid
+from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import fitz
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 # 加载 .env
 _env_path = Path(__file__).parent / ".env"
@@ -23,38 +31,226 @@ if _env_path.exists():
 # 确保能导入同目录模块
 sys.path.insert(0, str(Path(__file__).parent))
 
-from aerospace_search_main import HybridSearch, DualDBManager
+from aerospace_search_main import HybridSearch, DualDBManager, IndexOperationResult
 from aerospace_qa import ask_structured
 
 # ==========================================
 # FastAPI 应用
 # ==========================================
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+logger = logging.getLogger(__name__)
 app = FastAPI(title="航空航天知识检索 API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # 全局搜索引擎实例（启动时加载模型，复用）
-_engine: Optional[HybridSearch] = None
+_engine: Optional[object] = None
+_engine_lock = threading.Lock()
 
 
-def get_engine() -> HybridSearch:
+def get_engine():
     global _engine
     if _engine is None:
-        _engine = HybridSearch()
+        with _engine_lock:
+            if _engine is None:
+                try:
+                    _engine = HybridSearch()
+                except Exception as exc:
+                    raise HTTPException(status_code=503, detail=f"检索服务不可用，请先启动 Elasticsearch 和 Milvus：{exc}") from exc
     return _engine
+
+
+def _ensure_index_action_success(result: IndexOperationResult, success_actions: tuple[str, ...]) -> IndexOperationResult:
+    if result.success and result.action in success_actions:
+        return result
+
+    status_code = 500
+    error_code = str(result.error_code or "").strip().lower()
+    if error_code in {"database_unavailable"}:
+        status_code = 503
+    elif error_code in {"file_not_found"}:
+        status_code = 404
+    elif error_code in {"doc_dir_missing", "no_documents", "no_effective_content"}:
+        status_code = 400
+    raise HTTPException(status_code=status_code, detail=result.message or "索引操作失败")
+
+
+@lru_cache(maxsize=256)
+def _render_pdf_page_png(file_path: str, page: int, dpi: int, mtime_ns: int) -> bytes:
+    document = fitz.open(file_path)
+    try:
+        if page < 1 or page > document.page_count:
+            raise IndexError(page)
+        pdf_page = document.load_page(page - 1)
+        zoom = dpi / 72.0
+        pix = pdf_page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        return pix.tobytes("png")
+    finally:
+        document.close()
 
 
 # ==========================================
 # 1. 问答接口
 # ==========================================
+CHAT_DB_FILE = Path(__file__).parent / "chat_history.sqlite3"
+_chat_db_lock = threading.Lock()
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _get_chat_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(CHAT_DB_FILE, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _init_chat_db() -> None:
+    with _chat_db_lock:
+        with _get_chat_db() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS chat_conversations (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+                    content TEXT NOT NULL,
+                    payload_json TEXT,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY(conversation_id) REFERENCES chat_conversations(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation_created
+                    ON chat_messages(conversation_id, created_at, id);
+                CREATE INDEX IF NOT EXISTS idx_chat_conversations_updated
+                    ON chat_conversations(updated_at DESC);
+                """
+            )
+
+
+def _shorten_title(question: str) -> str:
+    compact = re.sub(r"\s+", " ", str(question or "")).strip()
+    if not compact:
+        return "Untitled Chat"
+    return compact[:40]
+
+
+def _answer_preview(payload: dict[str, Any], fallback: str = "") -> str:
+    answer = str(payload.get("answer") or fallback or "")
+    return re.sub(r"\s+", " ", answer).strip()[:160]
+
+
+def _ensure_chat_conversation(conversation_id: Optional[str], first_question: str) -> tuple[str, int, bool]:
+    created = False
+    now = _now_ms()
+    safe_id = str(conversation_id or "").strip()
+    if not safe_id:
+        safe_id = uuid.uuid4().hex
+
+    with _chat_db_lock:
+        with _get_chat_db() as conn:
+            row = conn.execute("SELECT created_at FROM chat_conversations WHERE id = ?", (safe_id,)).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO chat_conversations (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    (safe_id, _shorten_title(first_question), now, now),
+                )
+                created = True
+                created_at = now
+            else:
+                created_at = int(row["created_at"])
+    return safe_id, created_at, created
+
+
+def _load_chat_history(conversation_id: str, limit: int = 12) -> list[dict[str, Any]]:
+    with _chat_db_lock:
+        with _get_chat_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT role, content, payload_json
+                FROM chat_messages
+                WHERE conversation_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (conversation_id, limit),
+            ).fetchall()
+    return [
+        {
+            "role": row["role"],
+            "content": row["content"],
+            "payload": _parse_chat_payload(row["payload_json"]),
+        }
+        for row in reversed(rows)
+    ]
+
+
+def _store_chat_turn(conversation_id: str, question: str, qa_payload: dict[str, Any]) -> int:
+    now = _now_ms()
+    answer = str(qa_payload.get("answer") or "")
+    payload = dict(qa_payload)
+    payload["conversationId"] = conversation_id
+    with _chat_db_lock:
+        with _get_chat_db() as conn:
+            conn.execute(
+                "INSERT INTO chat_messages (conversation_id, role, content, payload_json, created_at) VALUES (?, 'user', ?, NULL, ?)",
+                (conversation_id, question, now),
+            )
+            conn.execute(
+                "INSERT INTO chat_messages (conversation_id, role, content, payload_json, created_at) VALUES (?, 'assistant', ?, ?, ?)",
+                (conversation_id, answer, json.dumps(payload, ensure_ascii=False), now + 1),
+            )
+            conn.execute(
+                "UPDATE chat_conversations SET updated_at = ? WHERE id = ?",
+                (now + 1, conversation_id),
+            )
+    return now + 1
+
+
+def _parse_chat_payload(payload_json: Optional[str]) -> Optional[dict[str, Any]]:
+    if not payload_json:
+        return None
+    try:
+        payload = json.loads(payload_json)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+_init_chat_db()
+
+
 class QARequest(BaseModel):
     question: str
+    conversationId: Optional[str] = None
+
+
+class EvidenceBBox(BaseModel):
+    x: float
+    y: float
+    width: float
+    height: float
 
 
 class QASourceItem(BaseModel):
@@ -64,11 +260,28 @@ class QASourceItem(BaseModel):
     parent_heading: str
     score: float
     chunk_id: str = ""
+    page_number: int = 1
+    page_count: int = 1
+    section_title: str = ""
+    highlight_text: str = ""
+    bbox: Optional[EvidenceBBox] = None
+    source_type: str = "text"
+    layout_type: str = "single_column"
+    parse_confidence: float = 0.0
+    document_type: str = "AMM"
+    is_ocr_fallback: bool = False
 
 
 class QAResponse(BaseModel):
     answer: str
-    sources: list[QASourceItem]
+    sources: list[QASourceItem] = Field(default_factory=list)
+    confidence: float = 0.0
+    abstainReason: str = ""
+    evidenceIds: list[str] = Field(default_factory=list)
+    queryType: str = ""
+    conversationId: str = ""
+    createdAt: int = 0
+    updatedAt: int = 0
 
 
 @app.post("/api/qa", response_model=QAResponse)
@@ -76,15 +289,150 @@ def qa_endpoint(req: QARequest):
     question = req.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="问题不能为空")
-    result = ask_structured(question, engine=get_engine())
-    return result
+    conversation_id, created_at, _ = _ensure_chat_conversation(req.conversationId, question)
+    history = _load_chat_history(conversation_id)
+    result = ask_structured(question, engine=get_engine(), history=history)
+    updated_at = _store_chat_turn(conversation_id, question, result)
+    return {
+        **result,
+        "conversationId": conversation_id,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+    }
 
 
 # ==========================================
 # 2. 仅检索接口（返回结构化检索结果，不调用 LLM）
 # ==========================================
+class ChatTitlePayload(BaseModel):
+    title: str
+
+
+@app.get("/api/chat/conversations")
+def list_chat_conversations(limit: int = Query(50, ge=1, le=200)):
+    with _chat_db_lock:
+        with _get_chat_db() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    c.id,
+                    c.title,
+                    c.created_at,
+                    c.updated_at,
+                    (
+                        SELECT content
+                        FROM chat_messages
+                        WHERE conversation_id = c.id AND role = 'user'
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 1
+                    ) AS latest_question,
+                    (
+                        SELECT content
+                        FROM chat_messages
+                        WHERE conversation_id = c.id AND role = 'assistant'
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 1
+                    ) AS latest_answer,
+                    (
+                        SELECT payload_json
+                        FROM chat_messages
+                        WHERE conversation_id = c.id AND role = 'assistant'
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 1
+                    ) AS latest_payload
+                FROM chat_conversations c
+                ORDER BY c.updated_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+    items = []
+    for row in rows:
+        payload = _parse_chat_payload(row["latest_payload"]) or {}
+        question = str(row["latest_question"] or "")
+        items.append(
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "question": question,
+                "preview": _answer_preview(payload, str(row["latest_answer"] or "")),
+                "createdAt": int(row["created_at"]),
+                "updatedAt": int(row["updated_at"]),
+            }
+        )
+    return items
+
+
+@app.get("/api/chat/conversations/{conversation_id}")
+def get_chat_conversation(conversation_id: str):
+    with _chat_db_lock:
+        with _get_chat_db() as conn:
+            conversation = conn.execute(
+                "SELECT id, title, created_at, updated_at FROM chat_conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if conversation is None:
+                raise HTTPException(status_code=404, detail="Chat conversation not found")
+
+            message_rows = conn.execute(
+                """
+                SELECT id, role, content, payload_json, created_at
+                FROM chat_messages
+                WHERE conversation_id = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (conversation_id,),
+            ).fetchall()
+
+    messages = [
+        {
+            "id": str(row["id"]),
+            "role": row["role"],
+            "content": row["content"],
+            "payload": _parse_chat_payload(row["payload_json"]),
+            "createdAt": int(row["created_at"]),
+        }
+        for row in message_rows
+    ]
+    latest_question = next((msg["content"] for msg in reversed(messages) if msg["role"] == "user"), "")
+    latest_assistant = next((msg for msg in reversed(messages) if msg["role"] == "assistant"), None)
+    latest_payload = latest_assistant.get("payload") if latest_assistant else None
+    return {
+        "id": conversation["id"],
+        "title": conversation["title"],
+        "question": latest_question,
+        "preview": _answer_preview(latest_payload or {}, latest_assistant.get("content", "") if latest_assistant else ""),
+        "createdAt": int(conversation["created_at"]),
+        "updatedAt": int(conversation["updated_at"]),
+        "messages": messages,
+    }
+
+
+@app.patch("/api/chat/conversations/{conversation_id}")
+def update_chat_conversation(conversation_id: str, payload: ChatTitlePayload):
+    title = _shorten_title(payload.title)
+    with _chat_db_lock:
+        with _get_chat_db() as conn:
+            cursor = conn.execute(
+                "UPDATE chat_conversations SET title = ? WHERE id = ?",
+                (title, conversation_id),
+            )
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Chat conversation not found")
+    return {"id": conversation_id, "title": title}
+
+
+@app.delete("/api/chat/conversations", status_code=204)
+def clear_chat_conversations():
+    with _chat_db_lock:
+        with _get_chat_db() as conn:
+            conn.execute("DELETE FROM chat_conversations")
+    return None
+
+
 class SearchResponse(BaseModel):
-    results: list[QASourceItem]
+    results: list[QASourceItem] = Field(default_factory=list)
 
 
 @app.post("/api/search", response_model=SearchResponse)
@@ -93,8 +441,74 @@ def search_endpoint(req: QARequest):
     if not question:
         raise HTTPException(status_code=400, detail="问题不能为空")
     engine = get_engine()
-    results = engine.search_for_qa(question)
+    try:
+        results = engine.search_for_qa(question)
+    except RuntimeError as exc:
+        logger.warning("检索接口执行失败 question=%s: %s", question, exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return {"results": results}
+
+
+@app.get("/api/evidence/page-image")
+def evidence_page_image(
+    doc_name: str = Query(..., description="Stored document file name"),
+    page: int = Query(1, ge=1),
+    dpi: int = Query(144, ge=72, le=220),
+):
+    resolved_name = _resolve_uploaded_file_name(doc_name, "PDF")
+    if not resolved_name:
+        raise HTTPException(status_code=404, detail=f"未找到文档: {doc_name}")
+
+    file_path = UPLOAD_DIR / resolved_name
+    if not file_path.exists() or file_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail=f"无法预览该文档: {resolved_name}")
+
+    try:
+        stat = file_path.stat()
+        png_bytes = _render_pdf_page_png(str(file_path), page, dpi, stat.st_mtime_ns)
+    except IndexError:
+        raise HTTPException(status_code=404, detail=f"页码越界: {page}") from None
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"生成预览失败: {exc}") from exc
+
+    return StreamingResponse(
+        io.BytesIO(png_bytes),
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.get("/api/health")
+def health_check():
+    details = {
+        "api": "ok",
+        "uploadDir": UPLOAD_DIR.exists(),
+        "stateFile": STATE_FILE.exists(),
+        "engineInitialized": _engine is not None,
+        "dbManagerInitialized": _db_manager is not None,
+    }
+    status = "ok"
+
+    try:
+        manager = get_db_manager()
+        details["elasticsearch"] = bool(manager.es_client.ping())
+        try:
+            manager.ensure_databases()
+            details["milvus"] = True
+        except Exception as exc:
+            details["milvus"] = False
+            details["milvusDetail"] = str(exc)
+            status = "degraded"
+    except Exception as exc:
+        details["elasticsearch"] = False
+        details["milvus"] = False
+        details["dbDetail"] = str(exc)
+        status = "degraded"
+
+    if not details["uploadDir"]:
+        status = "degraded"
+
+    return {"status": status, "details": details}
 
 
 # ==========================================
@@ -104,6 +518,7 @@ UPLOAD_DIR = Path(__file__).parent / "aerospace_docs"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 STATE_FILE = Path(__file__).parent / "management_state.json"
+HEALTH_REPORT_FILE = Path(__file__).parent / "document_health_reports.json"
 _DOCUMENT_TYPE_SUFFIX = {
     "PDF": ".pdf",
     "DOCX": ".docx",
@@ -333,6 +748,61 @@ def _persist_management_state():
         print(f"[WARN] 保存管理状态失败: {exc}")
 
 
+def _load_document_health_report_map() -> dict[str, dict]:
+    if not HEALTH_REPORT_FILE.exists():
+        return {}
+    try:
+        payload = json.loads(HEALTH_REPORT_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("读取文档健康报告失败: %s", exc)
+        return {}
+
+    if isinstance(payload, dict):
+        documents = payload.get("documents")
+        if isinstance(documents, dict):
+            return documents
+        return {str(key): value for key, value in payload.items() if isinstance(value, dict)}
+    return {}
+
+
+def _update_document_index_state(storage_file_name: str, chunk_count: int, status: str = "SYNCED") -> bool:
+    updated = False
+    for record in _documents:
+        if _get_document_storage_file_name(record).lower() != str(storage_file_name or "").lower():
+            continue
+        if chunk_count >= 0:
+            record["chunkCount"] = chunk_count
+        if status:
+            record["status"] = status
+        updated = True
+        break
+    if updated:
+        _persist_management_state()
+    return updated
+
+
+def _sync_document_index_state_from_reports():
+    reports = _load_document_health_report_map()
+    if not reports:
+        return
+
+    changed = False
+    for record in _documents:
+        storage_file_name = _get_document_storage_file_name(record)
+        report = reports.get(storage_file_name)
+        if not isinstance(report, dict):
+            continue
+        chunk_count = _safe_int(report.get("chunk_count"), record.get("chunkCount", 0))
+        if record.get("chunkCount") != chunk_count:
+            record["chunkCount"] = chunk_count
+            changed = True
+        if record.get("status") in {"READY", "INDEXING", "CHUNKING"}:
+            record["status"] = "SYNCED"
+            changed = True
+    if changed:
+        _persist_management_state()
+
+
 def _sync_documents_with_upload_dir() -> bool:
     global _documents, _doc_id_counter
 
@@ -450,11 +920,14 @@ def _delete_document_assets(record: dict):
 
     try:
         manager = get_db_manager()
-        manager.remove_document(storage_file_name)
-        global _engine
-        _engine = None
+        result = manager.remove_document(storage_file_name)
+        _ensure_index_action_success(result, ("remove_document",))
+    except HTTPException:
+        raise
     except Exception as exc:
-        print(f"[WARN] 删除索引失败 {storage_file_name}: {exc}")
+        raise HTTPException(status_code=503, detail=f"删除索引失败: {storage_file_name}: {exc}") from exc
+    global _engine
+    _engine = None
 
     file_path = UPLOAD_DIR / storage_file_name
     if file_path.exists():
@@ -465,6 +938,7 @@ def _delete_document_assets(record: dict):
 
 
 _load_management_state()
+_sync_document_index_state_from_reports()
 
 
 class KnowledgeBasePayload(BaseModel):
@@ -548,6 +1022,8 @@ def create_document(payload: DocumentPayload):
     display_name = _normalize_display_file_name(payload.fileName)
     if not display_name:
         raise HTTPException(status_code=400, detail="文档名称不能为空")
+    if not any(kb["id"] == payload.knowledgeBaseId for kb in _knowledge_bases):
+        raise HTTPException(status_code=400, detail="知识库不存在")
 
     document_type = _normalize_document_type(payload.type, payload.fileName)
     storage_file_name = _resolve_uploaded_file_name(payload.fileName, document_type)
@@ -618,11 +1094,37 @@ async def upload_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="未提供文件")
 
     safe_name = Path(file.filename).name
-    dest = UPLOAD_DIR / safe_name
-    content = await file.read()
-    dest.write_bytes(content)
+    if not safe_name:
+        raise HTTPException(status_code=400, detail="文件名无效")
+    if Path(safe_name).suffix.lower() not in _SUFFIX_TO_DOCUMENT_TYPE:
+        raise HTTPException(status_code=400, detail="仅支持 PDF、DOCX、PPTX、XLSX 文件")
 
-    size_mb = len(content) / (1024 * 1024)
+    dest = UPLOAD_DIR / safe_name
+    temp_dest = dest.with_suffix(f"{dest.suffix}.uploading")
+    total_bytes = 0
+    try:
+        if temp_dest.exists():
+            temp_dest.unlink()
+        with temp_dest.open("wb") as output:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                total_bytes += len(chunk)
+        temp_dest.replace(dest)
+    except Exception as exc:
+        for candidate in (temp_dest,):
+            try:
+                if candidate.exists():
+                    candidate.unlink()
+            except OSError:
+                pass
+        raise HTTPException(status_code=500, detail=f"保存上传文件失败: {exc}") from exc
+    finally:
+        await file.close()
+
+    size_mb = total_bytes / (1024 * 1024)
     return {
         "fileName": safe_name,
         "size": f"{size_mb:.1f} MB",
@@ -634,12 +1136,15 @@ async def upload_file(file: UploadFile = File(...)):
 # 6. 增量索引接口
 # ==========================================
 _db_manager: Optional[DualDBManager] = None
+_db_manager_lock = threading.Lock()
 
 
 def get_db_manager() -> DualDBManager:
     global _db_manager
     if _db_manager is None:
-        _db_manager = DualDBManager()
+        with _db_manager_lock:
+            if _db_manager is None:
+                _db_manager = DualDBManager()
     return _db_manager
 
 
@@ -649,17 +1154,23 @@ class IndexRequest(BaseModel):
 
 class IndexResponse(BaseModel):
     message: str
+    success: bool = True
+    action: str = ""
+    docName: str = ""
     chunkCount: int = 0
+    errorCode: str = ""
 
 
 def _extract_chunk_count_from_message(message: str) -> int:
-    """从索引结果文案中稳定提取语义块数量。"""
+    """从索引结果文案中稳定提取块数量。"""
     if not message:
         return 0
 
     patterns = [
         r"共\s*(\d+)\s*个语义块",
         r"(\d+)\s*个语义块",
+        r"共\s*(\d+)\s*个证据块",
+        r"(\d+)\s*个证据块",
     ]
     for pattern in patterns:
         match = re.search(pattern, message)
@@ -674,37 +1185,83 @@ def _extract_chunk_count_from_message(message: str) -> int:
 @app.post("/api/index", response_model=IndexResponse)
 def index_document(req: IndexRequest):
     """增量索引单个文档（不重建整个库）"""
-    file_path = UPLOAD_DIR / req.fileName
+    storage_file_name = _resolve_uploaded_file_name(req.fileName)
+    if not storage_file_name:
+        raise HTTPException(status_code=404, detail=f"文件不存在: {req.fileName}")
+    file_path = UPLOAD_DIR / storage_file_name
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"文件不存在: {req.fileName}")
-    manager = get_db_manager()
-    result = manager.add_document(str(file_path))
+    try:
+        manager = get_db_manager()
+        result = manager.add_document(str(file_path))
+        result = _ensure_index_action_success(result, ("add_document",))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"增量索引失败: {exc}") from exc
     # 索引成功后，需要重新初始化搜索引擎以加载新数据
     global _engine
     _engine = None
     # 从结果中提取块数（使用正则，避免文件名中含“共”导致误解析）
-    chunk_count = _extract_chunk_count_from_message(result)
-    return {"message": result, "chunkCount": chunk_count}
+    chunk_count = result.chunk_count if result.chunk_count > 0 else _extract_chunk_count_from_message(result.message)
+    _update_document_index_state(storage_file_name, chunk_count, status="SYNCED")
+    return {
+        "message": result.message,
+        "success": result.success,
+        "action": result.action,
+        "docName": storage_file_name,
+        "chunkCount": chunk_count,
+        "errorCode": result.error_code,
+    }
 
 
 @app.post("/api/rebuild-index")
 def rebuild_index():
     """全量重建索引"""
-    manager = get_db_manager()
-    result = manager.build_index()
+    try:
+        manager = get_db_manager()
+        result = manager.build_index()
+        result = _ensure_index_action_success(result, ("build_index",))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"重建索引失败: {exc}") from exc
     global _engine
     _engine = None
-    return {"message": result}
+    _sync_document_index_state_from_reports()
+    return {
+        "message": result.message,
+        "success": result.success,
+        "action": result.action,
+        "docName": "",
+        "chunkCount": result.chunk_count,
+        "errorCode": result.error_code,
+    }
 
 
 @app.delete("/api/index/{doc_name}")
 def remove_document_index(doc_name: str):
     """从索引中删除指定文档"""
-    manager = get_db_manager()
-    result = manager.remove_document(doc_name)
+    resolved_name = _resolve_uploaded_file_name(doc_name) or doc_name
+    try:
+        manager = get_db_manager()
+        result = manager.remove_document(resolved_name)
+        result = _ensure_index_action_success(result, ("remove_document",))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"删除索引失败: {resolved_name}: {exc}") from exc
     global _engine
     _engine = None
-    return {"message": result}
+    _update_document_index_state(resolved_name, 0, status="READY")
+    return {
+        "message": result.message,
+        "success": result.success,
+        "action": result.action,
+        "docName": resolved_name,
+        "chunkCount": result.chunk_count,
+        "errorCode": result.error_code,
+    }
 
 
 # ==========================================
@@ -830,7 +1387,7 @@ def summarize_title(req: SummarizeTitleRequest):
         user_prompt += f"\n回答摘要：{req.answer[:200]}"
 
     try:
-        title = call_qwen(system_prompt, user_prompt).strip().strip("\"'""''")
+        title = call_qwen(system_prompt, user_prompt).strip().strip("\"'")
         if len(title) > 20:
             title = title[:20]
         if not title:
