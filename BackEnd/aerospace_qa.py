@@ -9,7 +9,8 @@ from typing import Any, Dict, List, Optional
 import fitz
 from openai import OpenAI
 
-from aerospace_search_main import HybridSearch, analyze_query_intent
+from aerospace_structure import answer_structural_classification, answer_structural_count, answer_structural_definition, load_all_structural_records
+from aerospace_search_main import HybridSearch, analyze_query_intent, infer_query_precision_hints
 
 
 _env_path = Path(__file__).parent / ".env"
@@ -130,7 +131,13 @@ def build_context(search_results: List[Dict]) -> str:
 
 def prepare_prompt_evidence(search_results: List[Dict], query_type: str) -> List[Dict]:
     include_next_page = query_type == "article_lookup"
-    return [_enrich_pdf_page_context(row, include_next_page=include_next_page) for row in search_results]
+    prepared: List[Dict] = []
+    for row in search_results:
+        if _is_structural_evidence(row):
+            prepared.append(row)
+        else:
+            prepared.append(_enrich_pdf_page_context(row, include_next_page=include_next_page))
+    return prepared
 
 
 def _query_template(query_type: str) -> str:
@@ -223,7 +230,12 @@ def _extract_history_focus_doc(history: Optional[List[Dict[str, Any]]] = None) -
     if not history:
         return ""
 
+    # Only look at USER messages for document focus, not assistant responses
+    # (assistant responses may reference multiple documents)
     for message in reversed(history):
+        if str(message.get("role") or "").strip() != "user":
+            continue
+
         doc_name = _payload_source_doc_name(message.get("payload"))
         if doc_name:
             return doc_name
@@ -245,8 +257,9 @@ def _is_followup_query(query: str) -> bool:
     compact = query.strip()
     if not compact:
         return False
-    if len(compact) <= 36:
-        return True
+    precision_hints = infer_query_precision_hints(compact)
+    if precision_hints.get("route") and (precision_hints.get("subject_terms") or precision_hints.get("target_doc_name")):
+        return False
     if re.search(r"第\s*[0-9一二三四五六七八九十百千万]+\s*条", compact):
         return True
     return any(marker in compact for marker in ["它", "该", "这个", "这条", "上述", "继续", "还有", "上一", "前面", "其中"])
@@ -262,16 +275,17 @@ def _build_contextual_search_query(query: str, history: Optional[List[Dict[str, 
     if focus_doc_name and not explicit_doc_name and _is_followup_query(compact_query):
         return "\n".join([Path(focus_doc_name).stem, compact_query])
 
+    needs_context = _is_followup_query(compact_query)
+    if not needs_context:
+        return query
+
+    # Only use the most recent user turn for context to avoid polluting search with old queries
     recent_user_turns = [
         str(message.get("content") or "").strip()
         for message in history
         if str(message.get("role") or "").strip() == "user" and str(message.get("content") or "").strip()
-    ][-3:]
+    ][-1:]
     if not recent_user_turns:
-        return query
-
-    needs_context = _is_followup_query(compact_query)
-    if not needs_context:
         return query
 
     return "\n".join([*recent_user_turns, compact_query])
@@ -311,6 +325,226 @@ def call_qwen(system_prompt: str, user_prompt: str) -> str:
     return response.choices[0].message.content or ""
 
 
+def _compact_evidence_text(value: str) -> str:
+    return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9.]+", "", str(value or "").lower())
+
+
+def _query_terms(query: str) -> List[str]:
+    terms = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9.]{2,}", str(query or ""))
+    stop_terms = {"什么", "多少", "共有", "几个", "几条", "内容", "具体", "规定", "要求", "标准"}
+    deduped: List[str] = []
+    for term in terms:
+        if term in stop_terms or term in deduped:
+            continue
+        deduped.append(term)
+    return deduped
+
+
+def _evidence_haystack(row: Dict) -> str:
+    return "\n".join(
+        str(row.get(key) or "")
+        for key in (
+            "doc_name",
+            "section_title",
+            "heading",
+            "parent_heading",
+            "highlight_text",
+            "clause_path",
+            "content",
+        )
+    )
+
+
+def _is_structural_evidence(row: Dict) -> bool:
+    source_type = str(row.get("source_type") or "")
+    layout_type = str(row.get("layout_type") or "")
+    return source_type.startswith("structural") or layout_type == "structural" or bool(row.get("structural_node_id"))
+
+
+def _has_unmodified_subject(text: str, subject: str, modifiers: tuple[str, ...] = ("出口", "外国", "特殊", "标准", "临时", "限制", "生产", "型号")) -> bool:
+    compact_text = _compact_evidence_text(text)
+    compact_subject = _compact_evidence_text(subject)
+    if not compact_text or not compact_subject:
+        return False
+    start = 0
+    while True:
+        index = compact_text.find(compact_subject, start)
+        if index < 0:
+            return False
+        prefix = compact_text[max(0, index - 4) : index]
+        if not any(prefix.endswith(_compact_evidence_text(modifier)) for modifier in modifiers):
+            return True
+        start = index + len(compact_subject)
+
+
+def _direct_title_text(row: Dict) -> str:
+    title = str(row.get("section_title") or row.get("heading") or row.get("highlight_text") or "")
+    if ">" in title:
+        title = title.split(">")[-1]
+    return title
+
+
+def _qa_title_alignment_score(row: Dict, precision_hints: Dict) -> float:
+    route = str(precision_hints.get("route") or "")
+    if route not in {"classification", "issuance_requirement", "application_requirement", "procedure", "method", "definition", "scope", "document_scope", "time_limit", "numeric_threshold"}:
+        return 0.0
+    subject_terms = [term for term in precision_hints.get("subject_terms", []) if term]
+    intent_terms = [_compact_evidence_text(term) for term in precision_hints.get("intent_terms", []) if term]
+    if not subject_terms:
+        return 0.0
+    title = _direct_title_text(row)
+    compact_title = _compact_evidence_text(title)
+    has_subject = any(_has_unmodified_subject(compact_title, term) for term in subject_terms)
+    has_modified_subject = any(_compact_evidence_text(term) in compact_title for term in subject_terms) and not has_subject
+    has_intent = any(term and term in compact_title for term in intent_terms)
+    score = 0.0
+    if has_subject:
+        score += 1.0
+    if has_subject and has_intent:
+        score += 1.35
+    elif has_intent and not has_subject:
+        score -= 0.95
+    if has_modified_subject:
+        score -= 1.15
+    return score
+
+
+def _evidence_quality_score(query: str, row: Dict, profile: Dict) -> float:
+    raw_score = max(float(row.get("score", 0.0) or 0.0), 0.0)
+    parse_confidence = max(min(float(row.get("parse_confidence", 0.0) or 0.0), 1.0), 0.0)
+    haystack = _compact_evidence_text(_evidence_haystack(row))
+    terms = _query_terms(query)
+    matched_terms = sum(1 for term in terms if _compact_evidence_text(term) in haystack)
+    term_score = matched_terms / max(len(terms), 1)
+    # Normalize raw_score with sigmoid to compress into [0, 1] range
+    normalized_score = 1.0 / (1.0 + math.exp(-max(min(raw_score, 8.0), -8.0)))
+    score = normalized_score + 0.35 * parse_confidence + 0.65 * term_score
+
+    if _is_structural_evidence(row):
+        score += 0.35
+    if row.get("bbox"):
+        score += 0.12
+    if str(row.get("chunk_role") or "") in set(profile.get("target_roles", [])):
+        score += 0.18
+
+    target_doc_name = str(profile.get("target_doc_name") or "")
+    if target_doc_name:
+        score += 0.30 if str(row.get("doc_name") or "") == target_doc_name else -0.35
+
+    query_signature = profile.get("query_signature", {})
+    article_variants = query_signature.get("article_label_variants", []) or query_signature.get("article_id_variants", [])
+    if article_variants and any(_compact_evidence_text(variant) in haystack for variant in article_variants):
+        score += 0.50
+    elif article_variants:
+        score -= 0.30
+
+    if str(row.get("source_type") or "").endswith("toc"):
+        score -= 0.50
+
+    precision_hints = profile.get("precision_hints") or infer_query_precision_hints(query)
+    haystack_compact = _compact_evidence_text(_evidence_haystack(row))
+    article_number = str(row.get("article_id") or row.get("structural_number") or "").replace("第", "").replace("条", "")
+    if precision_hints.get("target_doc_name"):
+        score += 0.45 if str(row.get("doc_name") or "") == precision_hints["target_doc_name"] else -0.65
+    score += _qa_title_alignment_score(row, precision_hints)
+    preferred_articles = {str(value) for value in precision_hints.get("preferred_articles", []) if value}
+    if preferred_articles:
+        score += 1.1 if article_number in preferred_articles else -0.25
+    if article_number in {str(value) for value in precision_hints.get("related_articles", []) if value}:
+        score += 0.25
+    if article_number in {str(value) for value in precision_hints.get("negative_articles", []) if value}:
+        score -= 1.3
+    required_terms = [_compact_evidence_text(term) for term in precision_hints.get("required_terms", []) if term]
+    if required_terms:
+        matched = sum(1 for term in required_terms if term in haystack_compact)
+        if precision_hints.get("strict_term_match") and matched == 0:
+            score -= 1.6
+        else:
+            score += 0.18 * matched
+    forbidden_terms = [_compact_evidence_text(term) for term in precision_hints.get("forbidden_terms", []) if term]
+    if forbidden_terms and any(term in haystack_compact for term in forbidden_terms):
+        score -= 2.5
+    return round(score, 6)
+
+
+def _select_prompt_evidence(query: str, search_results: List[Dict], query_type: str) -> List[Dict]:
+    if not search_results:
+        return []
+
+    profile = analyze_query_intent(query)
+    target_doc_name = _resolve_doc_name_from_text(query)
+    if target_doc_name:
+        profile["target_doc_name"] = target_doc_name
+    max_items = 4 if query_type in {"fault_diagnosis", "procedure"} else 3
+    scored = []
+    for rank, row in enumerate(search_results):
+        rank_bonus = max(0.0, 0.32 - 0.05 * rank)
+        if rank == 0 and _is_structural_evidence(row):
+            rank_bonus += 0.18
+        scored.append((_evidence_quality_score(query, row, profile) + rank_bonus, row))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if not scored:
+        return []
+
+    top_score, top_row = scored[0]
+    top_doc = str(top_row.get("doc_name") or "")
+    structural_top = _is_structural_evidence(top_row)
+    min_keep_score = max(0.58, top_score * (0.52 if not structural_top else 0.74))
+    selected: List[Dict] = []
+    seen_keys = set()
+    target_roles = {role for role in profile.get("target_roles", []) if role != "text"}
+
+    for quality, row in scored:
+        if selected and quality < min_keep_score:
+            continue
+        if structural_top and selected and top_doc and row.get("doc_name") != top_doc and quality < top_score * 0.85:
+            continue
+        if structural_top and selected and not _is_structural_evidence(row) and top_doc and row.get("doc_name") != top_doc and quality < top_score * 0.60:
+            continue
+        if selected and target_roles and str(row.get("chunk_role") or "") not in target_roles and quality < top_score * 0.95:
+            continue
+        key = (
+            row.get("doc_name", ""),
+            int(row.get("page_number") or 1),
+            row.get("article_id") or row.get("structural_node_id") or row.get("section_title") or row.get("heading") or "",
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        enriched = dict(row)
+        enriched["evidence_quality"] = quality
+        selected.append(enriched)
+        if len(selected) >= max_items:
+            break
+
+    return selected or [dict(top_row)]
+
+
+def _repair_response_sources(engine: Optional[HybridSearch], sources: List[Dict]) -> List[Dict]:
+    if not sources or engine is None or not hasattr(engine, "repair_evidence_location"):
+        return sources
+    repaired_sources: List[Dict] = []
+    for source in sources:
+        try:
+            repaired_sources.append(engine.repair_evidence_location(source))
+        except Exception as exc:
+            logger.debug("证据定位修复失败 chunk_id=%s: %s", source.get("chunk_id"), exc)
+            repaired_sources.append(source)
+    return repaired_sources
+
+
+def _finalize_source_payload(payload: Optional[Dict], engine: Optional[HybridSearch]) -> Optional[Dict]:
+    if not payload:
+        return payload
+    sources = payload.get("sources")
+    if isinstance(sources, list):
+        finalized = dict(payload)
+        finalized["sources"] = _repair_response_sources(engine, sources)
+        finalized["evidenceIds"] = [row.get("chunk_id", "") for row in finalized["sources"] if row.get("chunk_id")]
+        return finalized
+    return payload
+
+
 def _estimate_confidence(search_results: List[Dict]) -> float:
     if not search_results:
         return 0.0
@@ -320,25 +554,6 @@ def _estimate_confidence(search_results: List[Dict]) -> float:
     diversity_component = min(len(search_results) / 3.0, 1.0)
     confidence = 0.55 * score_component + 0.25 * parse_component + 0.20 * diversity_component
     return round(confidence, 4)
-
-
-def _select_prompt_evidence(search_results: List[Dict], query_type: str) -> List[Dict]:
-    if not search_results:
-        return []
-
-    selected = []
-    seen_keys = set()
-    max_items = 4 if query_type in {"fault_diagnosis", "procedure"} else 3
-
-    for row in search_results:
-        key = (row.get("doc_name", ""), row.get("page_number", 1), row.get("section_title") or row.get("heading") or "")
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
-        selected.append(row)
-        if len(selected) >= max_items:
-            break
-    return selected
 
 
 def _abstain_message(query_type: str) -> str:
@@ -598,12 +813,24 @@ def _extract_pdf_applicability_section(file_name: str) -> Optional[Dict]:
     )
     match = pattern.search(combined)
     if not match:
+        # Fallback: match 适用范围 with colon or space separator, no number prefix required
+        pattern2 = re.compile(
+            r"(?P<label>适用范围)\s*[:：\s]+"
+            r"(?P<body>.+?)(?=\n\s*(?:[一-鿿]{2,8}[:：]|$))",
+            re.S,
+        )
+        match = pattern2.search(combined)
+    if not match:
         return None
 
     label = re.sub(r"\s+", "", match.group("label"))
     raw_section = f"{match.group('label')}\n{match.group('body')}"
     section = re.sub(r"\n\s*\u2014\s*\d+\s*\u2014\s*", "\n", raw_section)
     section = re.sub(r"[ \t]+", " ", section)
+    section = re.sub(r"\n{3,}", "\n\n", section).strip()
+    # Clean up TOC noise (dot leaders, page numbers)
+    section = re.sub(r"[.\u00b7\u3002\uff0e]{3,}\s*-?\s*\d+\s*-?\s*", "", section)
+    section = re.sub(r"^\s*\d+\s*$", "", section, flags=re.M)
     section = re.sub(r"\n{3,}", "\n\n", section).strip()
     compact_section = re.sub(r"\s+", "", section)
 
@@ -625,7 +852,10 @@ def _extract_pdf_applicability_section(file_name: str) -> Optional[Dict]:
 def _try_answer_document_applicability(query: str, query_type: str) -> Optional[Dict]:
     if "\u9002\u7528\u8303\u56f4" not in query:
         return None
-    if not any(marker in query for marker in ("\u4e0b\u53d1", "\u6587\u4ef6", "\u54a8\u8be2\u901a\u544a", "\u672c\u6587\u4ef6")):
+    # Accept queries that mention a document name OR contain scope-related markers
+    has_doc_reference = _find_pdf_by_query_reference(query) is not None
+    has_scope_marker = any(marker in query for marker in ("\u4e0b\u53d1", "\u6587\u4ef6", "\u54a8\u8be2\u901a\u544a", "\u672c\u6587\u4ef6", "\u300a", "\u300b"))
+    if not has_doc_reference and not has_scope_marker:
         return None
 
     file_path = _find_pdf_by_query_reference(query)
@@ -666,22 +896,94 @@ def _try_answer_document_applicability(query: str, query_type: str) -> Optional[
     }
 
 
+def _is_valid_query(query: str) -> bool:
+    """Reject empty, whitespace-only, or nonsensical queries."""
+    compact = re.sub(r"\s+", "", str(query or ""))
+    if len(compact) < 2:
+        return False
+    # Must contain at least one Chinese character for aerospace domain
+    chinese_chars = re.findall(r"[一-鿿]", compact)
+    if len(chinese_chars) < 1:
+        return False
+    # Check if query contains at least some meaningful characters
+    meaningful = re.findall(r"[一-鿿A-Za-z0-9]", compact)
+    if len(meaningful) < 2:
+        return False
+    # Reject if > 70% is non-meaningful characters
+    if len(meaningful) / len(compact) < 0.3:
+        return False
+    return True
+
+
+def _definition_query_term(query: str) -> str:
+    cleaned = re.sub(r"\s+", "", str(query or ""))
+    if not cleaned:
+        return ""
+    match = re.search(r"^(?P<term>.+?)的定义(?:是|是什么|为)?$", cleaned)
+    if match:
+        return match.group("term")
+    match = re.search(r"^(?P<term>.+?)是什么$", cleaned)
+    if match:
+        term = match.group("term")
+        if not any(token in term for token in ("颁发", "条件", "要求", "步骤", "程序", "流程", "申请", "审查", "如何", "怎样", "哪个", "哪些", "怎么")):
+            return term
+    return ""
+
+
 def ask_structured(query: str, engine: HybridSearch = None, history: Optional[List[Dict[str, Any]]] = None) -> Dict:
+
+    if not _is_valid_query(query):
+        query_type = "general"
+        return {
+            "answer": "请输入有效的技术问题。问题需包含至少两个有意义的字符。",
+            "sources": [],
+            "confidence": 0.0,
+            "abstainReason": "invalid_query",
+            "evidenceIds": [],
+            "queryType": query_type,
+        }
 
     query_profile = analyze_query_intent(query)
     query_type = query_profile["query_type"]
+    structural_records = load_all_structural_records()
+    structural_count_answer = answer_structural_count(query, structural_records)
+    if structural_count_answer:
+        structural_count_answer["queryType"] = query_type
+        return _finalize_source_payload(structural_count_answer, engine)
+
+    structural_classification_answer = answer_structural_classification(query, structural_records)
+    if structural_classification_answer:
+        structural_classification_answer["queryType"] = query_type
+        return _finalize_source_payload(structural_classification_answer, engine)
+
+    structural_definition_answer = answer_structural_definition(query, structural_records)
+    if structural_definition_answer:
+        structural_definition_answer["queryType"] = query_type
+        return _finalize_source_payload(structural_definition_answer, engine)
+    definition_term = _definition_query_term(query)
+    if definition_term:
+        return {
+            "answer": f"当前证据不足，无法确认“{definition_term}”在已索引文档中有明确的术语定义。建议改问适航证的类别、申请资格、提交文件或颁发条件等具体条款内容。",
+            "sources": [],
+            "confidence": 0.0,
+            "abstainReason": "no_definition_evidence",
+            "evidenceIds": [],
+            "queryType": query_type,
+        }
+
     applicability_answer = _try_answer_document_applicability(query, query_type)
     if applicability_answer:
-        return applicability_answer
+        return _finalize_source_payload(applicability_answer, engine)
 
     direct_answer = _try_answer_article_count(query, query_type)
     if direct_answer:
-        return direct_answer
+        return _finalize_source_payload(direct_answer, engine)
 
     if engine is None:
-        engine = HybridSearch()
+        engine = HybridSearch(hyde_llm_call=call_qwen)
     try:
-        search_results = engine.search_for_qa(_build_contextual_search_query(query, history))
+        search_query = _build_contextual_search_query(query, history)
+        search_results = engine.search_for_qa(search_query)
     except Exception as exc:
         logger.exception("问答检索失败 query=%s", query)
         return {
@@ -692,8 +994,10 @@ def ask_structured(query: str, engine: HybridSearch = None, history: Optional[Li
             "evidenceIds": [],
             "queryType": query_type,
         }
-    evidence_ids = [row.get("chunk_id", "") for row in search_results if row.get("chunk_id")]
-    confidence = _estimate_confidence(search_results)
+    selected_sources = _select_prompt_evidence(search_query, search_results, query_type)
+    selected_sources = _repair_response_sources(engine, selected_sources)
+    evidence_ids = [row.get("chunk_id", "") for row in selected_sources if row.get("chunk_id")]
+    confidence = _estimate_confidence(selected_sources)
 
     if not search_results:
         return {
@@ -708,14 +1012,14 @@ def ask_structured(query: str, engine: HybridSearch = None, history: Optional[Li
     if confidence < 0.46:
         return {
             "answer": _abstain_message(query_type),
-            "sources": search_results,
+            "sources": selected_sources,
             "confidence": confidence,
             "abstainReason": "low_confidence",
             "evidenceIds": evidence_ids,
             "queryType": query_type,
         }
 
-    prompt_results = prepare_prompt_evidence(_select_prompt_evidence(search_results, query_type), query_type)
+    prompt_results = prepare_prompt_evidence(selected_sources, query_type)
     context = build_context(prompt_results)
     user_prompt = build_user_prompt(query, context, query_type, history=history)
     try:
@@ -735,7 +1039,7 @@ def ask_structured(query: str, engine: HybridSearch = None, history: Optional[Li
 
     return {
         "answer": answer,
-        "sources": search_results,
+        "sources": selected_sources,
         "confidence": confidence,
         "abstainReason": "",
         "evidenceIds": evidence_ids,

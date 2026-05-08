@@ -32,7 +32,7 @@ if _env_path.exists():
 sys.path.insert(0, str(Path(__file__).parent))
 
 from aerospace_search_main import HybridSearch, DualDBManager, IndexOperationResult
-from aerospace_qa import ask_structured
+from aerospace_qa import ask_structured, call_qwen
 
 # ==========================================
 # FastAPI 应用
@@ -65,7 +65,7 @@ def get_engine():
         with _engine_lock:
             if _engine is None:
                 try:
-                    _engine = HybridSearch()
+                    _engine = HybridSearch(hyde_llm_call=call_qwen)
                 except Exception as exc:
                     raise HTTPException(status_code=503, detail=f"检索服务不可用，请先启动 Elasticsearch 和 Milvus：{exc}") from exc
     return _engine
@@ -200,7 +200,7 @@ def _load_chat_history(conversation_id: str, limit: int = 12) -> list[dict[str, 
         {
             "role": row["role"],
             "content": row["content"],
-            "payload": _parse_chat_payload(row["payload_json"]),
+            "payload": _normalize_cached_payload_sources(row["content"], _parse_chat_payload(row["payload_json"])),
         }
         for row in reversed(rows)
     ]
@@ -238,6 +238,45 @@ def _parse_chat_payload(payload_json: Optional[str]) -> Optional[dict[str, Any]]
         return None
 
 
+def _normalize_cached_payload_sources(message_content: str, payload: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if not payload:
+        return payload
+    sources = payload.get("sources")
+    if not isinstance(sources, list) or len(sources) < 2:
+        return payload
+
+    content = str(message_content or "")
+    matched_doc_names = set()
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        doc_name = Path(str(source.get("doc_name") or "")).name
+        if not doc_name:
+            continue
+        stem = Path(doc_name).stem
+        if doc_name in content or (stem and stem in content):
+            matched_doc_names.add(doc_name)
+
+    if not matched_doc_names:
+        return payload
+
+    ordered_sources = sorted(
+        enumerate(sources),
+        key=lambda item: (
+            0 if Path(str(item[1].get("doc_name") or "")).name in matched_doc_names else 1,
+            item[0],
+        ),
+    )
+    normalized_sources = [source for _, source in ordered_sources]
+    if normalized_sources == sources:
+        return payload
+
+    normalized = dict(payload)
+    normalized["sources"] = normalized_sources
+    normalized["evidenceIds"] = [source.get("chunk_id", "") for source in normalized_sources if isinstance(source, dict) and source.get("chunk_id")]
+    return normalized
+
+
 _init_chat_db()
 
 
@@ -253,6 +292,14 @@ class EvidenceBBox(BaseModel):
     height: float
 
 
+class EvidenceBBoxPage(BaseModel):
+    page_number: int
+    bbox: EvidenceBBox
+    highlight_text: str = ""
+    matched_line_count: int = 0
+    semantic_line_count: int = 0
+
+
 class QASourceItem(BaseModel):
     content: str
     doc_name: str
@@ -265,11 +312,19 @@ class QASourceItem(BaseModel):
     section_title: str = ""
     highlight_text: str = ""
     bbox: Optional[EvidenceBBox] = None
+    bbox_pages: list[EvidenceBBoxPage] = Field(default_factory=list)
     source_type: str = "text"
     layout_type: str = "single_column"
     parse_confidence: float = 0.0
     document_type: str = "AMM"
     is_ocr_fallback: bool = False
+    article_id: str = ""
+    article_label: str = ""
+    clause_path: str = ""
+    chunk_role: str = "text"
+    structural_node_id: str = ""
+    structural_parent_id: str = ""
+    structural_record_type: str = ""
 
 
 class QAResponse(BaseModel):
@@ -349,7 +404,7 @@ def list_chat_conversations(limit: int = Query(50, ge=1, le=200)):
 
     items = []
     for row in rows:
-        payload = _parse_chat_payload(row["latest_payload"]) or {}
+        payload = _normalize_cached_payload_sources(row["latest_answer"], _parse_chat_payload(row["latest_payload"])) or {}
         question = str(row["latest_question"] or "")
         items.append(
             {
@@ -390,7 +445,7 @@ def get_chat_conversation(conversation_id: str):
             "id": str(row["id"]),
             "role": row["role"],
             "content": row["content"],
-            "payload": _parse_chat_payload(row["payload_json"]),
+            "payload": _normalize_cached_payload_sources(row["content"], _parse_chat_payload(row["payload_json"])),
             "createdAt": int(row["created_at"]),
         }
         for row in message_rows
@@ -428,6 +483,16 @@ def clear_chat_conversations():
     with _chat_db_lock:
         with _get_chat_db() as conn:
             conn.execute("DELETE FROM chat_conversations")
+    return None
+
+
+@app.delete("/api/chat/conversations/{conversation_id}", status_code=204)
+def delete_chat_conversation(conversation_id: str):
+    with _chat_db_lock:
+        with _get_chat_db() as conn:
+            cursor = conn.execute("DELETE FROM chat_conversations WHERE id = ?", (conversation_id,))
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Chat conversation not found")
     return None
 
 
@@ -511,6 +576,24 @@ def health_check():
     return {"status": status, "details": details}
 
 
+@app.post("/api/reload-modules")
+def reload_modules():
+    """Hot-reload QA/search modules without restarting the server (keeps model in memory)."""
+    import importlib
+    import aerospace_search_main
+    import aerospace_qa
+    import aerospace_structure
+    importlib.reload(aerospace_structure)
+    importlib.reload(aerospace_search_main)
+    importlib.reload(aerospace_qa)
+    # Re-import into this module's namespace
+    globals()["ask_structured"] = aerospace_qa.ask_structured
+    globals()["HybridSearch"] = aerospace_search_main.HybridSearch
+    globals()["DualDBManager"] = aerospace_search_main.DualDBManager
+    globals()["IndexOperationResult"] = aerospace_search_main.IndexOperationResult
+    return {"status": "ok", "message": "Modules reloaded successfully"}
+
+
 # ==========================================
 # 3. 知识库 / 文档管理状态
 # ==========================================
@@ -543,6 +626,54 @@ _DEFAULT_KNOWLEDGE_BASES = [
 ]
 
 _KNOWLEDGE_BASE_RULES = [
+    (103, "命中上位法律法规关键词", [
+        "民用航空法",
+        "中华人民共和国飞行基本规则",
+        "民用机场管理条例",
+        "通用航空飞行管制条例",
+        "无人驾驶航空器飞行管理暂行条例",
+        "民用航空器国籍登记条例",
+        "民用航空器权利登记条例",
+        "民用航空安全保卫条例",
+        "国务院令",
+        "行政法规",
+    ]),
+    (104, "命中国际公约/条约关键词", [
+        "国际民用航空公约",
+        "国际公约",
+        "公约",
+        "议定书",
+        "蒙特利尔",
+        "华沙",
+        "东京",
+        "海牙",
+        "开普敦",
+        "icaoannex",
+    ]),
+    (106, "命中维修手册与技术文档关键词", [
+        "amm",
+        "emm",
+        "fim",
+        "tsm",
+        "srm",
+        "ipc",
+        "维修手册",
+        "故障隔离",
+        "结构修理",
+        "aviationmaintenancetechnician",
+        "aircraftinspection",
+        "aircraftrepair",
+        "aircraftalterations",
+        "maintenanceprogram",
+        "repairstation",
+        "qualitycontrolmanual",
+        "ac43.13",
+        "ac120-16",
+        "ac20-106",
+        "ac145-9",
+    ]),
+    (105, "命中适航指令与通告关键词", ["适航指令", "服务通告", "维护通告", "airworthinessdirective"]),
+    (101, "命中民航规章关键词（如 CCAR/部令/适航标准）", ["ccar", "民航规章", "部令", "适航标准", "运行规则"]),
     (102, "命中规范性文件关键词（如运行合格审定规则/管理办法/咨询通告）", [
         "运行合格审定规则",
         "合格审定规则",
@@ -553,13 +684,7 @@ _KNOWLEDGE_BASE_RULES = [
         "工作程序",
         "规范性文件",
         "ac-",
-        "ac",
     ]),
-    (101, "命中民航规章关键词（如 CCAR/部令/适航标准）", ["ccar", "民航规章", "部令", "适航标准", "运行规则"]),
-    (103, "命中法律法规关键词", ["民用航空法", "中华人民共和国", "国务院令", "法律", "条例", "行政法规"]),
-    (104, "命中国际公约/国际标准关键词", ["icao", "faa", "easa", "annex", "国际公约", "适航协议"]),
-    (105, "命中适航指令与通告关键词", ["ad", "sb", "适航指令", "服务通告", "维护通告"]),
-    (106, "命中维修手册与技术文档关键词", ["amm", "emm", "fim", "tsm", "srm", "ipc", "维修手册", "故障隔离", "结构修理"]),
     (107, "命中培训与参考资料关键词", ["培训", "课件", "答辩", "术语", "缩略语", "参考资料"]),
 ]
 
@@ -909,7 +1034,8 @@ def _load_management_state():
                 default=4000,
             )
 
-    if _sync_documents_with_upload_dir() or not state_exists:
+    skip_upload_dir_sync = os.environ.get("AEROSPACE_SKIP_UPLOAD_DIR_SYNC") == "1"
+    if (not skip_upload_dir_sync and _sync_documents_with_upload_dir()) or not state_exists:
         _persist_management_state()
 
 

@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.log
+*.sqlite
+*.sqlite3
+.DS_Store
+Thumbs.db
+
+# Local runtime artifacts
+BackEnd/aerospace_docs/
+BackEnd/structural_records/
+BackEnd/chat_history.sqlite3
+BackEnd/backend*.log
+BackEnd/backend*.err.log
+BackEnd/backend*.out.log
+BackEnd/model_download.log
+BackEnd/reindex_latest.log
+BackEnd/pdf_search.txt
+BackEnd/*_report.json
+BackEnd/classification_audit.json
+BackEnd/document_health_reports.json
+BackEnd/ppt_highlight_cases/
+BackEnd/ppt_highlight_cases_fixed/
+_tmp_*.png
+round*_results.json
+
+# Frontend generated output
+FrontEnd/node_modules/
+FrontEnd/dist/
+FrontEnd/*.tsbuildinfo
+FrontEnd/.platform-stamp.json

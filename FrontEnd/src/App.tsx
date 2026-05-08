@@ -513,6 +513,18 @@ type QAApiEvidenceSource = {
     width: number;
     height: number;
   };
+  bbox_pages?: Array<{
+    page_number: number;
+    bbox: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    };
+    highlight_text?: string;
+    matched_line_count?: number;
+    semantic_line_count?: number;
+  }>;
   source_type?: string;
   layout_type?: string;
   parse_confidence?: number;
@@ -665,6 +677,18 @@ function buildAssistantConversationFromQAData(
     return merged.length > 0 ? merged : ["（无内容）"];
   };
 
+  const compactCitationPart = (value: string, fallback: string, maxLength: number) => {
+    const normalized = normalizeEvidenceText(value || fallback);
+    if (normalized.length <= maxLength) return normalized;
+    return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
+  };
+
+  const buildCitationLabel = (docTitle: string, title: string, page: number) => {
+    const doc = compactCitationPart(stripDocumentExtension(docTitle), "检索文档", 18);
+    const heading = compactCitationPart(title, "定位证据", 28);
+    return `${doc}-${heading}-P${page}`;
+  };
+
   const citations: AssistantCitation[] = rawSources.map((src, index) => {
     const page = Math.max(1, src.page_number || 1);
     const chapter = normalizeEvidenceText(src.section_title || src.heading || src.parent_heading || "");
@@ -676,7 +700,7 @@ function buildAssistantConversationFromQAData(
 
     return {
       id: `${turnId}-c${index + 1}`,
-      label: `${compactDocumentTitle} / ${compactHighlight} / P${page}`.slice(0, 72),
+      label: buildCitationLabel(compactDocumentTitle, compactHighlight, page),
       sourceId,
       documentTitle,
       documentType: normalizeDocumentType(src.document_type),
@@ -690,6 +714,7 @@ function buildAssistantConversationFromQAData(
         chapter,
         textAnchor: highlight,
         bbox: src.bbox,
+        bboxPages: src.bbox_pages,
       },
     };
   });
@@ -775,12 +800,14 @@ async function callEvidenceAwareQAApi(
   question: string,
   conversationId?: string,
   baseConversation?: AssistantConversation | null,
+  signal?: AbortSignal,
 ): Promise<AssistantConversation | null> {
   try {
     const response = await fetch(`${managementApiBase}/qa`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ question, ...(conversationId ? { conversationId } : {}) }),
+      signal,
     });
     if (!response.ok) throw new Error(`QA API error: ${response.status}`);
     const data: QAApiEvidenceResponse = await response.json();
@@ -790,6 +817,7 @@ async function callEvidenceAwareQAApi(
       createdAt: data.updatedAt ?? Date.now(),
     });
   } catch (err) {
+    if (err instanceof DOMException && err.name === "AbortError") return null;
     console.warn("QA API unavailable; showing service status message instead of mock evidence.", err);
     return null;
   }
@@ -898,6 +926,11 @@ async function updatePersistedConversationTitle(conversationId: string, title: s
 async function clearPersistedAssistantHistory() {
   const response = await fetch(`${managementApiBase}/chat/conversations`, { method: "DELETE" });
   if (!response.ok && response.status !== 204) throw new Error(`Clear chat history API error: ${response.status}`);
+}
+
+async function deletePersistedAssistantConversation(conversationId: string) {
+  const response = await fetch(`${managementApiBase}/chat/conversations/${encodeURIComponent(conversationId)}`, { method: "DELETE" });
+  if (!response.ok && response.status !== 204 && response.status !== 404) throw new Error(`Delete chat conversation API error: ${response.status}`);
 }
 
 const knowledgeBaseDocumentService = {
@@ -2335,19 +2368,22 @@ function CitationTag({
   active: boolean;
   onClick: () => void;
 }) {
+  const sourceTitle = citation.documentTitle.replace(/\.(pdf|docx|pptx|xlsx)$/i, "");
+  const evidenceTitle = citation.highlightText || citation.chapter || citation.label;
+
   return (
     <motion.button
       type="button"
-      whileHover={{ scale: 1.035 }}
+      aria-label={citation.label}
+      whileHover={{ scale: 1.012 }}
       whileTap={{ scale: 0.985 }}
       onClick={onClick}
-      className={`group relative inline-flex items-center gap-2 overflow-hidden border px-2.5 py-1 text-[10px] uppercase tracking-[0.24em] transition-[border-color,background,transform,color,box-shadow] duration-250 ${
+      className={`group relative grid min-h-[4.25rem] w-full max-w-full grid-cols-[1.35rem_minmax(4.5rem,8.5rem)_minmax(0,1fr)_3.8rem] items-center gap-3 overflow-hidden rounded-md border px-3 py-2 text-left normal-case tracking-[0] transition-[border-color,background,transform,color,box-shadow] duration-250 sm:min-w-[34rem] ${
         active ? "text-white" : "text-white/72"
       }`}
       style={{
         borderColor: active ? `${secondary}aa` : `${accent}55`,
         background: active ? `${secondary}18` : `${accent}0f`,
-        clipPath: "polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 0 100%)",
         boxShadow: active ? `0 0 20px ${secondary}22` : `0 0 0 rgba(0,0,0,0)`,
       }}
     >
@@ -2359,12 +2395,15 @@ function CitationTag({
         className="pointer-events-none absolute inset-x-2 bottom-0 h-px origin-left scale-x-0 transition-transform duration-250 group-hover:scale-x-100"
         style={{ background: `linear-gradient(90deg, transparent, ${active ? secondary : accent}, transparent)` }}
       />
-      <motion.span
-        className="relative z-10 h-[5px] w-[5px] rounded-full"
-        style={{ background: active ? secondary : accent, boxShadow: `0 0 12px ${active ? secondary : accent}` }}
-        whileHover={{ scale: 1.25 }}
-      />
-      <span className="relative z-10">{citation.label}</span>
+      <FileText size={17} className="relative z-10 text-white/64" />
+      <span className="relative z-10 min-w-0 truncate text-[12px] font-medium text-white/54">{sourceTitle}</span>
+      <span className="relative z-10 min-w-0">
+        <span className="block truncate text-[14px] font-semibold leading-5 text-white/90">{evidenceTitle}</span>
+        <span className="mt-1 block truncate text-[11px] leading-4 text-white/44">{citation.chapter || citation.documentType}</span>
+      </span>
+      <span className="relative z-10 justify-self-end rounded-full bg-white/10 px-3 py-1 text-center text-[12px] font-semibold text-white">
+        P{citation.page}
+      </span>
     </motion.button>
   );
 }
@@ -2513,7 +2552,7 @@ function AssistantAnswerCard({
                 </div>
                 <div className="border-t border-white/[0.06] pt-3">
                   <div className="mb-2 text-[10px] uppercase tracking-[0.3em] text-white/34">参考来源</div>
-                  <div className="flex flex-wrap gap-2">
+                  <div className="grid gap-2">
                     {seg.citationIds
                       .map((citationId) => citationsById.get(citationId))
                       .filter((citation): citation is AssistantCitation => Boolean(citation))
@@ -2543,7 +2582,7 @@ function AssistantAnswerCard({
                     </div>
                     <div className="min-w-0 flex-1 text-[14px] leading-7 text-white/80">
                       <span>{segment.text} </span>
-                      <span className="inline-flex flex-wrap gap-2 align-middle">
+                      <div className="mt-3 grid gap-2">
                         {segment.citationIds
                           .map((citationId) => citationsById.get(citationId))
                           .filter((citation): citation is AssistantCitation => Boolean(citation))
@@ -2557,7 +2596,7 @@ function AssistantAnswerCard({
                               onClick={() => onCitationClick(citation.id)}
                             />
                           ))}
-                      </span>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -2675,11 +2714,13 @@ function AssistantHistoryRow({
   item,
   active,
   onSelect,
+  onDelete,
 }: {
   chapter: Chapter;
   item: AssistantHistoryItem;
   active: boolean;
   onSelect: (item: AssistantHistoryItem) => void;
+  onDelete: (item: AssistantHistoryItem) => void;
 }) {
   const pointer = useInteractivePointer({
     maxShiftRatio: 0.008,
@@ -2763,11 +2804,8 @@ function AssistantHistoryRow({
           />
         </>
       ) : null}
-      <button
-        type="button"
-        onClick={() => onSelect(item)}
-        className="relative z-10 flex w-full min-w-0 items-center px-3 py-2.5 text-left transition-colors duration-200"
-      >
+      <div className="relative z-10 flex min-w-0 items-center gap-1 px-3 py-2.5 transition-colors duration-200">
+        <button type="button" onClick={() => onSelect(item)} className="flex min-w-0 flex-1 items-center text-left">
         <div className="flex min-w-0 flex-1 items-center gap-2.5">
           <div
             className={`min-w-0 flex-1 truncate text-[13px] tracking-[0.01em] ${
@@ -2784,7 +2822,19 @@ function AssistantHistoryRow({
             {formatAssistantHistoryTime(item.createdAt)}
           </div>
         </div>
-      </button>
+        </button>
+        <button
+          type="button"
+          aria-label={`删除会话 ${item.title || item.question}`}
+          onClick={(event) => {
+            event.stopPropagation();
+            onDelete(item);
+          }}
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-sm text-white/30 opacity-0 transition-[background,color,opacity] duration-200 hover:bg-white/8 hover:text-white/80 group-hover:opacity-100"
+        >
+          <Trash2 size={13} />
+        </button>
+      </div>
     </motion.div>
   );
 }
@@ -3060,7 +3110,8 @@ function PdfPreviewPane({
   const hasPrev = dynamicPreview ? pageNumber > 1 : currentIndex > 0;
   const hasNext = dynamicPreview ? pageNumber < source.pageCount : currentIndex >= 0 && currentIndex < source.pages.length - 1;
   const activeHighlight = citation && citation.page === resolvedCurrentPage.pageNumber ? citation.highlightText : "";
-  const activeBbox = citation && citation.page === pageNumber ? citation.evidenceLocation.bbox : undefined;
+  const activeBboxPage = citation?.evidenceLocation.bboxPages?.find((item) => item.page_number === pageNumber);
+  const activeBbox = activeBboxPage?.bbox ?? (citation && citation.page === pageNumber ? citation.evidenceLocation.bbox : undefined);
   const fallbackLines =
     resolvedCurrentPage.lines.length > 0
       ? resolvedCurrentPage.lines
@@ -3079,20 +3130,10 @@ function PdfPreviewPane({
   return (
     <div className="grid gap-3">
       <div className="paper-shell relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-[1.8rem] px-6 py-6 text-[#17181b]">
-        <div className="relative z-10 grid gap-4 md:grid-cols-[minmax(0,1fr)_auto] md:items-start">
+        <div className="relative z-10 min-w-0">
           <div className="min-w-0">
-            <div className="text-[10px] uppercase tracking-[0.28em] text-[#5c5d61]/70">
-              {previewImageUrl && !imageFailed ? "真实 PDF 预览" : "证据文本预览"}
-            </div>
-            <div className="text-[10px] uppercase tracking-[0.28em] text-[#5c5d61]/70">{source.documentType}</div>
-            <div className="mt-2 text-xl font-semibold">{source.documentTitle}</div>
-            <div className="mt-2 text-sm text-[#57585c]">{resolvedCurrentPage.sectionTitle}</div>
-          </div>
-          <div className="grid gap-3 md:justify-items-end">
-            <div className="text-left md:text-right">
-              <div className="text-[10px] uppercase tracking-[0.28em] text-[#66686d]/70">章节</div>
-              <div className="mt-2 text-sm font-medium">{source.chapter}</div>
-            </div>
+            <div className="text-[10px] uppercase tracking-[0.28em] text-[#5c5d61]/70">来源文档</div>
+            <div className="mt-2 break-words text-xl font-semibold leading-8">{source.documentTitle}</div>
           </div>
         </div>
         <div className="relative z-10 mt-6 flex-1">
@@ -5415,6 +5456,9 @@ function AviationAssistantPage({
   const [conversation, setConversation] = useState<AssistantConversation | null>(null);
   const [draft, setDraft] = useState("");
   const [loading, setLoading] = useState(false);
+  const loadingRef = useRef(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const conversationRef = useRef<AssistantConversation | null>(null);
   const [documentTypeFilter, setDocumentTypeFilter] = useState<AssistantDocumentType | "ALL">("ALL");
   const [aircraftModelFilter, setAircraftModelFilter] = useState("ALL");
   const [selectedCitationId, setSelectedCitationId] = useState<string | null>(null);
@@ -5526,12 +5570,20 @@ function AviationAssistantPage({
   const runConversation = async (question: string) => {
     const trimmedQuestion = question.trim();
 
-    if (!trimmedQuestion || loading) return;
+    if (!trimmedQuestion || loadingRef.current) return;
+
+    // Abort any previous in-flight request
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
 
     setDraft("");
     setLoading(true);
+    loadingRef.current = true;
 
-    const baseConversation = conversation;
+    const baseConversation = conversationRef.current;
     const pendingConversation: AssistantConversation = baseConversation
       ? {
           ...baseConversation,
@@ -5553,10 +5605,13 @@ function AviationAssistantPage({
           sources: [],
         };
     setConversation(pendingConversation);
+    conversationRef.current = pendingConversation;
 
     try {
       // 调用真实 API，失败则 fallback 到 mock
-      const apiConversation = await callEvidenceAwareQAApi(trimmedQuestion, baseConversation?.id, baseConversation);
+      const apiConversation = await callEvidenceAwareQAApi(trimmedQuestion, baseConversation?.id, baseConversation, controller.signal);
+      // If this request was aborted, don't apply results
+      if (controller.signal.aborted) return;
       const resolvedConversation = apiConversation ?? createServiceUnavailableConversation(trimmedQuestion, baseConversation);
       const isPersistedConversation = Boolean(apiConversation);
 
@@ -5571,6 +5626,7 @@ function AviationAssistantPage({
       };
 
       hydrateConversation(resolvedConversation);
+      conversationRef.current = resolvedConversation;
       setHistoryItems((current) => [
         historyEntry,
         ...current.filter((item) => item.id !== historyEntry.id).slice(0, 19),
@@ -5596,10 +5652,22 @@ function AviationAssistantPage({
       });
     } finally {
       setLoading(false);
+      loadingRef.current = false;
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
     }
   };
 
   const handleRestoreHistory = async (item: AssistantHistoryItem) => {
+    // Abort any in-flight QA request to prevent stale response overwriting restored conversation
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setLoading(false);
+    loadingRef.current = false;
+
     setActiveHistoryId(item.id);
     setDraft("");
 
@@ -5609,6 +5677,7 @@ function AviationAssistantPage({
       if (!nextConversation) return;
 
       hydrateConversation(nextConversation);
+      conversationRef.current = nextConversation;
       setDocumentTypeFilter(nextConversation.documentTypeFocus);
       setAircraftModelFilter(nextConversation.aircraftModel);
       setHistoryItems((current) =>
@@ -5632,6 +5701,10 @@ function AviationAssistantPage({
 
   const handleToggleEvidencePanel = () => {
     if (!conversation) return;
+    if (evidencePanelOpen) {
+      setEvidencePanelOpen(false);
+      return;
+    }
 
     if (!selectedCitationId) {
       const fallbackCitation = conversation.citations[0] ?? null;
@@ -5642,7 +5715,7 @@ function AviationAssistantPage({
       }
     }
 
-    setEvidencePanelOpen((current) => !current);
+    setEvidencePanelOpen(true);
   };
 
   const resetConversationShell = () => {
@@ -5653,6 +5726,14 @@ function AviationAssistantPage({
     setEvidenceMode("active");
     setPreviewPage(1);
     setActiveHistoryId(null);
+  };
+
+  const handleDeleteHistory = (item: AssistantHistoryItem) => {
+    setHistoryItems((current) => current.filter((historyItem) => historyItem.id !== item.id));
+    if (activeHistoryId === item.id) {
+      resetConversationShell();
+    }
+    void deletePersistedAssistantConversation(item.id).catch(() => undefined);
   };
 
   const emptyState = (
@@ -5750,6 +5831,7 @@ function AviationAssistantPage({
                         item={item}
                         active={active}
                         onSelect={handleRestoreHistory}
+                        onDelete={handleDeleteHistory}
                       />
                     );
                   })

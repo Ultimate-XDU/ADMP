@@ -1,1 +1,8 @@
 .env
+__pycache__/
+*.py[cod]
+*.pyo
+*.log
+*.sqlite
+*.sqlite3
+pdf_search.txt

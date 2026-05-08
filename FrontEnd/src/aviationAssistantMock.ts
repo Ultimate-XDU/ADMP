@@ -8,6 +8,18 @@
     width: number;
     height: number;
   };
+  bboxPages?: Array<{
+    page_number: number;
+    bbox: {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    };
+    highlight_text?: string;
+    matched_line_count?: number;
+    semantic_line_count?: number;
+  }>;
 };
 
 export type AssistantDocumentType = "AMM" | "FIM" | "TSM" | "IPC" | "SRM";
