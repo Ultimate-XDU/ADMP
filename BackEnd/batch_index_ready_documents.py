@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 import time
 from pathlib import Path
 
+from management_state_store import load_state
+
 
 BASE_DIR = Path(__file__).resolve().parent
-STATE_FILE = BASE_DIR / "management_state.json"
 
 
 def ready_count() -> int:
-    payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    payload = load_state()
     return sum(
         1
         for document in payload.get("documents", [])

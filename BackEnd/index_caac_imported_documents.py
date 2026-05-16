@@ -8,11 +8,11 @@ import traceback
 from pathlib import Path
 
 from aerospace_search_main import DOC_DIR, DualDBManager
+from management_state_store import load_state, update_document_state
 
 
 BASE_DIR = Path(__file__).resolve().parent
 REPORT_FILE = BASE_DIR / "caac_import_report.json"
-STATE_FILE = BASE_DIR / "management_state.json"
 DOC_DIR_PATH = Path(DOC_DIR)
 
 
@@ -37,27 +37,12 @@ def _load_json(path: Path, fallback):
         return fallback
 
 
-def _save_json(path: Path, payload) -> None:
-    temp = path.with_suffix(".tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(path)
-
-
 def _update_document_state(storage_file_name: str, status: str, chunk_count: int | None = None, summary: str = "") -> None:
-    payload = _load_json(STATE_FILE, {})
-    changed = False
-    for document in payload.get("documents", []):
-        if document.get("storageFileName") != storage_file_name:
-            continue
-        document["status"] = status
-        if chunk_count is not None:
-            document["chunkCount"] = int(chunk_count)
-        if summary:
-            document["summary"] = summary
-        changed = True
-        break
-    if changed:
-        _save_json(STATE_FILE, payload)
+    if status == "INDEXING" and summary:
+        summary = f"CAAC分批索引中：{_now()}"
+    elif status == "SYNCED" and summary:
+        summary = f"CAAC分批索引成功：{_now()}"
+    update_document_state(storage_file_name, status, chunk_count=chunk_count, summary=summary)
 
 
 def _selected_report_items(start: int, limit: int) -> list[dict]:
@@ -67,35 +52,38 @@ def _selected_report_items(start: int, limit: int) -> list[dict]:
     return report[start_index:end_index]
 
 
-def _ready_state_items(start: int, limit: int) -> list[dict]:
-    payload = _load_json(STATE_FILE, {})
+def _ready_state_items(start: int, limit: int, order: str, max_size_mb: float | None) -> list[dict]:
+    payload = load_state()
     documents = [
         document
         for document in payload.get("documents", [])
-        if document.get("status") in {"READY", "FAILED", "INDEXING"} and document.get("storageFileName")
+        if document.get("status") == "READY" and document.get("storageFileName")
     ]
-    documents.sort(key=lambda item: int(item.get("id") or 0))
+    if max_size_mb is not None:
+        max_size_bytes = max_size_mb * 1024 * 1024
+        documents = [
+            document
+            for document in documents
+            if (DOC_DIR_PATH / document["storageFileName"]).exists()
+            and (DOC_DIR_PATH / document["storageFileName"]).stat().st_size <= max_size_bytes
+        ]
+    if order == "size":
+        documents.sort(
+            key=lambda item: (
+                (DOC_DIR_PATH / item["storageFileName"]).stat().st_size
+                if (DOC_DIR_PATH / item["storageFileName"]).exists()
+                else sys.maxsize,
+                int(item.get("id") or 0),
+            )
+        )
+    else:
+        documents.sort(key=lambda item: int(item.get("id") or 0))
     start_index = max(start - 1, 0)
     end_index = start_index + max(limit, 0) if limit else None
     return [{"file": document["storageFileName"]} for document in documents[start_index:end_index]]
 
 
-def main() -> int:
-    _configure_console()
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--start", type=int, default=1, help="1-based item number in caac_import_report.json")
-    parser.add_argument("--limit", type=int, default=5, help="documents to index in this run")
-    parser.add_argument("--sleep", type=float, default=2.0, help="seconds to pause between documents")
-    parser.add_argument("--ready", action="store_true", help="index READY/FAILED/INDEXING documents from management_state.json")
-    args = parser.parse_args()
-
-    items = _ready_state_items(args.start, args.limit) if args.ready else _selected_report_items(args.start, args.limit)
-    if not items:
-        print(f"[{_now()}] no report items selected")
-        return 0
-
-    print(f"[{_now()}] indexing CAAC imported docs start={args.start} limit={args.limit} count={len(items)}")
-    manager = DualDBManager()
+def _index_selected_items(manager: DualDBManager, items: list[dict], args: argparse.Namespace) -> list[tuple[str, str]]:
     failures: list[tuple[str, str]] = []
 
     for offset, item in enumerate(items, start=args.start):
@@ -139,6 +127,29 @@ def main() -> int:
 
         if args.sleep > 0:
             time.sleep(args.sleep)
+
+    return failures
+
+
+def main() -> int:
+    _configure_console()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", type=int, default=1, help="1-based item number in caac_import_report.json")
+    parser.add_argument("--limit", type=int, default=5, help="documents to index in this run")
+    parser.add_argument("--sleep", type=float, default=2.0, help="seconds to pause between documents")
+    parser.add_argument("--ready", action="store_true", help="index READY documents from management_state.json")
+    parser.add_argument("--order", choices=("id", "size"), default="id", help="READY document order")
+    parser.add_argument("--max-size-mb", type=float, default=None, help="skip READY documents larger than this size")
+    args = parser.parse_args()
+
+    items = _ready_state_items(args.start, args.limit, args.order, args.max_size_mb) if args.ready else _selected_report_items(args.start, args.limit)
+    if not items:
+        print(f"[{_now()}] no report items selected")
+        return 0
+
+    print(f"[{_now()}] indexing CAAC imported docs start={args.start} limit={args.limit} count={len(items)}")
+    with DualDBManager() as manager:
+        failures = _index_selected_items(manager, items, args)
 
     print("\n" + "=" * 72)
     print(f"[{_now()}] batch done failures={len(failures)}")

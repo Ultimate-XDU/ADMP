@@ -9,8 +9,10 @@ from typing import Any, Dict, List, Optional
 import fitz
 from openai import OpenAI
 
+from aerospace_evidence_scores import ensure_evidence_score_fields, evidence_display_score, evidence_ranking_score
 from aerospace_structure import answer_structural_classification, answer_structural_count, answer_structural_definition, load_all_structural_records
 from aerospace_search_main import HybridSearch, analyze_query_intent, infer_query_precision_hints
+from aerospace_retrieval_contract import RetrievalContract, apply_contract, build_retrieval_contract
 
 
 _env_path = Path(__file__).parent / ".env"
@@ -119,7 +121,7 @@ def build_context(search_results: List[Dict]) -> str:
         section = row.get("section_title") or row.get("heading") or row.get("parent_heading") or "未标注章节"
         page_number = row.get("page_number", 1)
         source_type = row.get("source_type", "text")
-        score = float(row.get("score", 0.0))
+        score = evidence_display_score(row)
         parse_confidence = float(row.get("parse_confidence", 0.0))
         parts.append(
             f"--- 证据 {index} | 文档: {doc_name} | 章节: {section} | 页码: {page_number} | 类型: {source_type} | 相关度: {score:.4f} | 解析置信度: {parse_confidence:.2f} ---"
@@ -410,7 +412,7 @@ def _qa_title_alignment_score(row: Dict, precision_hints: Dict) -> float:
 
 
 def _evidence_quality_score(query: str, row: Dict, profile: Dict) -> float:
-    raw_score = max(float(row.get("score", 0.0) or 0.0), 0.0)
+    raw_score = evidence_ranking_score(row)
     parse_confidence = max(min(float(row.get("parse_confidence", 0.0) or 0.0), 1.0), 0.0)
     haystack = _compact_evidence_text(_evidence_haystack(row))
     terms = _query_terms(query)
@@ -467,7 +469,68 @@ def _evidence_quality_score(query: str, row: Dict, profile: Dict) -> float:
     return round(score, 6)
 
 
-def _select_prompt_evidence(query: str, search_results: List[Dict], query_type: str) -> List[Dict]:
+def _multi_target_doc_names(contract: Optional[RetrievalContract]) -> List[str]:
+    if contract is None or not contract.allow_multi_doc:
+        return []
+    return [str(name or "") for name in contract.synced_target_doc_names if name]
+
+
+def _source_identity_key(row: Dict) -> tuple:
+    return (
+        str(row.get("doc_name") or ""),
+        int(row.get("page_number") or 1),
+        str(row.get("chunk_id") or row.get("structural_node_id") or row.get("article_id") or row.get("section_title") or row.get("heading") or ""),
+    )
+
+
+def _ensure_multi_target_prompt_coverage(selected: List[Dict], candidates: List[Dict], contract: Optional[RetrievalContract], max_items: int) -> List[Dict]:
+    target_doc_names = _multi_target_doc_names(contract)
+    if len(target_doc_names) < 2:
+        return selected
+
+    output = [dict(row) for row in selected]
+    seen_docs = {str(row.get("doc_name") or "") for row in output}
+    seen_keys = {_source_identity_key(row) for row in output}
+    additions: List[Dict] = []
+
+    for target_doc_name in target_doc_names:
+        if target_doc_name in seen_docs:
+            continue
+        target_row = next((row for row in candidates if row.get("doc_name") == target_doc_name), None)
+        if target_row is None:
+            continue
+        key = _source_identity_key(target_row)
+        if key in seen_keys:
+            continue
+        additions.append(dict(target_row))
+        seen_docs.add(target_doc_name)
+        seen_keys.add(key)
+
+    if not additions:
+        return output[:max_items]
+
+    merged: List[Dict] = []
+    seen_keys.clear()
+
+    def append(row: Dict) -> None:
+        key = _source_identity_key(row)
+        if key in seen_keys:
+            return
+        seen_keys.add(key)
+        merged.append(row)
+
+    if output:
+        append(output[0])
+    for row in additions:
+        append(row)
+    for row in output[1:]:
+        append(row)
+        if len(merged) >= max_items:
+            break
+    return merged[:max_items]
+
+
+def _select_prompt_evidence(query: str, search_results: List[Dict], query_type: str, contract: Optional[RetrievalContract] = None) -> List[Dict]:
     if not search_results:
         return []
 
@@ -475,7 +538,7 @@ def _select_prompt_evidence(query: str, search_results: List[Dict], query_type: 
     target_doc_name = _resolve_doc_name_from_text(query)
     if target_doc_name:
         profile["target_doc_name"] = target_doc_name
-    max_items = 4 if query_type in {"fault_diagnosis", "procedure"} else 3
+    max_items = 4 if query_type in {"fault_diagnosis", "procedure"} or len(_multi_target_doc_names(contract)) >= 2 else 3
     scored = []
     for rank, row in enumerate(search_results):
         rank_bonus = max(0.0, 0.32 - 0.05 * rank)
@@ -517,7 +580,8 @@ def _select_prompt_evidence(query: str, search_results: List[Dict], query_type: 
         if len(selected) >= max_items:
             break
 
-    return selected or [dict(top_row)]
+    selected = selected or [dict(top_row)]
+    return _ensure_multi_target_prompt_coverage(selected, [row for _, row in scored], contract, max_items)
 
 
 def _repair_response_sources(engine: Optional[HybridSearch], sources: List[Dict]) -> List[Dict]:
@@ -533,26 +597,146 @@ def _repair_response_sources(engine: Optional[HybridSearch], sources: List[Dict]
     return repaired_sources
 
 
+def _is_noisy_highlight_line(value: str) -> bool:
+    line = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(line) < 4:
+        return True
+    if re.fullmatch(r"[A-Za-z]{4,14}", line) and line.lower() in {
+        "standard",
+        "aircraft",
+        "appendix",
+        "section",
+        "chapter",
+        "general",
+        "landing",
+        "manual",
+        "program",
+        "maintenance",
+    }:
+        return True
+    if re.fullmatch(r"\d+[/.-]\d+[/.-]\d+", line):
+        return True
+    if re.fullmatch(r"(?:AC|FAA|CCAR)\s*[-\w. ]{1,12}", line, flags=re.I):
+        return True
+    if re.fullmatch(r"(?:Page|Par)\s+[\w() -]+", line, flags=re.I):
+        return True
+    return False
+
+
+def _meaningful_highlight_lines(value: str, max_lines: int = 12) -> List[str]:
+    lines: List[str] = []
+    for raw_line in str(value or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line or line == "[SECTION]" or _is_noisy_highlight_line(line):
+            continue
+        lines.append(line)
+        if len(lines) >= max_lines:
+            break
+    return lines
+
+
+def _select_source_highlight(source: Dict) -> str:
+    content = str(source.get("content") or "")
+    section = str(source.get("section_title") or source.get("heading") or "")
+    raw_highlight = str(source.get("highlight_text") or "")
+    haystack = _compact_evidence_text(f"{content}\n{section}")
+
+    raw_compact = _compact_evidence_text(raw_highlight)
+    if raw_highlight and len(raw_highlight) <= 220 and raw_compact and raw_compact in haystack:
+        return raw_highlight
+
+    for line in _meaningful_highlight_lines(raw_highlight):
+        compact_line = _compact_evidence_text(line)
+        if compact_line and compact_line in haystack:
+            return line[:220]
+
+    for line in _meaningful_highlight_lines(content):
+        if len(line) >= 6:
+            return line[:220]
+
+    for line in _meaningful_highlight_lines(section):
+        return line[:220]
+
+    return ""
+
+
+def _normalize_response_source(source: Dict) -> Dict:
+    normalized = ensure_evidence_score_fields(source)
+    normalized["highlight_text"] = _select_source_highlight(normalized)
+    return normalized
+
+
 def _finalize_source_payload(payload: Optional[Dict], engine: Optional[HybridSearch]) -> Optional[Dict]:
     if not payload:
         return payload
     sources = payload.get("sources")
     if isinstance(sources, list):
         finalized = dict(payload)
-        finalized["sources"] = _repair_response_sources(engine, sources)
+        finalized["sources"] = [
+            _normalize_response_source(source)
+            for source in _repair_response_sources(engine, sources)
+        ]
         finalized["evidenceIds"] = [row.get("chunk_id", "") for row in finalized["sources"] if row.get("chunk_id")]
         return finalized
     return payload
 
 
+def _abstain_payload(query_type: str, reason: str, *, contract: Optional[RetrievalContract] = None, evidence_ids: Optional[List[str]] = None) -> Dict:
+    payload = {
+        "answer": _abstain_message(query_type),
+        "sources": [],
+        "confidence": 0.0,
+        "abstainReason": reason,
+        "evidenceIds": evidence_ids or [],
+        "queryType": query_type,
+    }
+    if contract is not None:
+        payload["retrievalContract"] = contract.to_dict()
+    return payload
+
+
+def _apply_contract_to_answer(payload: Optional[Dict], contract: RetrievalContract, query_type: str) -> Optional[Dict]:
+    if not payload:
+        return None
+    contracted_sources = apply_contract(
+        contract,
+        payload.get("sources", []),
+        keep_failed_when_no_hard_constraints=True,
+    )
+    if not contracted_sources:
+        return _abstain_payload(query_type, "contract_no_supporting_evidence", contract=contract)
+    enriched = dict(payload)
+    enriched["sources"] = contracted_sources
+    enriched["queryType"] = query_type
+    enriched["retrievalContract"] = contract.to_dict()
+    enriched["evidenceIds"] = [row.get("chunk_id", "") for row in contracted_sources if row.get("chunk_id")]
+    return enriched
+
+
+def _finalized_contract_answer_or_none(payload: Optional[Dict], contract: RetrievalContract, query_type: str, engine: Optional[HybridSearch]) -> Optional[Dict]:
+    contracted = _apply_contract_to_answer(payload, contract, query_type) if payload else None
+    if not contracted or contracted.get("abstainReason"):
+        return None
+    return _finalize_source_payload(contracted, engine)
+
+
 def _estimate_confidence(search_results: List[Dict]) -> float:
     if not search_results:
         return 0.0
-    top_score = float(search_results[0].get("score", 0.0))
-    score_component = 1.0 / (1.0 + math.exp(-max(min(top_score, 10.0), -10.0)))
+    score_component = evidence_display_score(search_results[0])
     parse_component = sum(float(row.get("parse_confidence", 0.0)) for row in search_results[:3]) / max(min(len(search_results), 3), 1)
     diversity_component = min(len(search_results) / 3.0, 1.0)
     confidence = 0.55 * score_component + 0.25 * parse_component + 0.20 * diversity_component
+    contract_scores = [
+        float(row.get("contract_score", 0.0) or 0.0)
+        for row in search_results[:3]
+        if row.get("contract_passed") is not False
+    ]
+    if contract_scores:
+        contract_component = min(max(sum(contract_scores) / (3.0 * len(contract_scores)), 0.0), 1.0)
+        confidence = 0.72 * confidence + 0.28 * contract_component
+    elif any(row.get("contract_passed") is False for row in search_results[:3]):
+        confidence *= 0.55
     return round(confidence, 4)
 
 
@@ -943,27 +1127,33 @@ def ask_structured(query: str, engine: HybridSearch = None, history: Optional[Li
             "queryType": query_type,
         }
 
+    contract = build_retrieval_contract(query)
     query_profile = analyze_query_intent(query)
     query_type = query_profile["query_type"]
+    if contract.block_reason:
+        return _abstain_payload(query_type, contract.block_reason, contract=contract)
+    if engine is None:
+        with HybridSearch(hyde_llm_call=call_qwen) as local_engine:
+            return ask_structured(query, engine=local_engine, history=history)
     structural_records = load_all_structural_records()
     structural_count_answer = answer_structural_count(query, structural_records)
-    if structural_count_answer:
-        structural_count_answer["queryType"] = query_type
-        return _finalize_source_payload(structural_count_answer, engine)
+    finalized_structural = _finalized_contract_answer_or_none(structural_count_answer, contract, query_type, engine)
+    if finalized_structural:
+        return finalized_structural
 
     structural_classification_answer = answer_structural_classification(query, structural_records)
-    if structural_classification_answer:
-        structural_classification_answer["queryType"] = query_type
-        return _finalize_source_payload(structural_classification_answer, engine)
+    finalized_structural = _finalized_contract_answer_or_none(structural_classification_answer, contract, query_type, engine)
+    if finalized_structural:
+        return finalized_structural
 
     structural_definition_answer = answer_structural_definition(query, structural_records)
-    if structural_definition_answer:
-        structural_definition_answer["queryType"] = query_type
-        return _finalize_source_payload(structural_definition_answer, engine)
+    finalized_structural = _finalized_contract_answer_or_none(structural_definition_answer, contract, query_type, engine)
+    if finalized_structural:
+        return finalized_structural
     definition_term = _definition_query_term(query)
-    if definition_term:
+    if definition_term and not contract.article_variants and not (contract.required_terms or contract.focus_terms or contract.targets):
         return {
-            "answer": f"当前证据不足，无法确认“{definition_term}”在已索引文档中有明确的术语定义。建议改问适航证的类别、申请资格、提交文件或颁发条件等具体条款内容。",
+            "answer": f"当前证据不足，无法确认“{definition_term}”在已索引文档中有明确的术语定义。建议补充所属文件、章节或具体业务场景后再查询。",
             "sources": [],
             "confidence": 0.0,
             "abstainReason": "no_definition_evidence",
@@ -972,15 +1162,15 @@ def ask_structured(query: str, engine: HybridSearch = None, history: Optional[Li
         }
 
     applicability_answer = _try_answer_document_applicability(query, query_type)
-    if applicability_answer:
-        return _finalize_source_payload(applicability_answer, engine)
+    finalized_direct = _finalized_contract_answer_or_none(applicability_answer, contract, query_type, engine)
+    if finalized_direct:
+        return finalized_direct
 
     direct_answer = _try_answer_article_count(query, query_type)
-    if direct_answer:
-        return _finalize_source_payload(direct_answer, engine)
+    finalized_direct = _finalized_contract_answer_or_none(direct_answer, contract, query_type, engine)
+    if finalized_direct:
+        return finalized_direct
 
-    if engine is None:
-        engine = HybridSearch(hyde_llm_call=call_qwen)
     try:
         search_query = _build_contextual_search_query(query, history)
         search_results = engine.search_for_qa(search_query)
@@ -994,8 +1184,16 @@ def ask_structured(query: str, engine: HybridSearch = None, history: Optional[Li
             "evidenceIds": [],
             "queryType": query_type,
         }
-    selected_sources = _select_prompt_evidence(search_query, search_results, query_type)
+    search_results = apply_contract(contract, search_results, keep_failed_when_no_hard_constraints=True)
+    selected_sources = _select_prompt_evidence(search_query, search_results, query_type, contract=contract)
+    selected_sources = apply_contract(
+        contract,
+        selected_sources,
+        keep_failed_when_no_hard_constraints=True,
+        preserve_order=True,
+    )
     selected_sources = _repair_response_sources(engine, selected_sources)
+    selected_sources = [_normalize_response_source(source) for source in selected_sources]
     evidence_ids = [row.get("chunk_id", "") for row in selected_sources if row.get("chunk_id")]
     confidence = _estimate_confidence(selected_sources)
 
@@ -1007,6 +1205,7 @@ def ask_structured(query: str, engine: HybridSearch = None, history: Optional[Li
             "abstainReason": "no_evidence",
             "evidenceIds": [],
             "queryType": query_type,
+            "retrievalContract": contract.to_dict(),
         }
 
     if confidence < 0.46:
@@ -1017,6 +1216,7 @@ def ask_structured(query: str, engine: HybridSearch = None, history: Optional[Li
             "abstainReason": "low_confidence",
             "evidenceIds": evidence_ids,
             "queryType": query_type,
+            "retrievalContract": contract.to_dict(),
         }
 
     prompt_results = prepare_prompt_evidence(selected_sources, query_type)
@@ -1028,7 +1228,7 @@ def ask_structured(query: str, engine: HybridSearch = None, history: Optional[Li
         logger.warning("调用大模型失败 query=%s: %s", query, exc)
         return {
             "answer": _llm_unavailable_message(prompt_results or search_results, query_type),
-            "sources": search_results,
+            "sources": selected_sources,
             "confidence": confidence,
             "abstainReason": "llm_unavailable",
             "evidenceIds": evidence_ids,

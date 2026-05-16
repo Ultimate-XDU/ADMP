@@ -1,19 +1,21 @@
 from __future__ import annotations
 
-import json
+import argparse
+import os
 import sys
 import time
 import traceback
 from pathlib import Path
 
 from elasticsearch import Elasticsearch
+import torch
 
 from aerospace_search_main import DOC_DIR, EMBEDDING_MODEL, ES_HOST, ES_INDEX, RERANK_MODEL, VECTOR_DIM, DualDBManager
 from aerospace_structure import clear_structural_records
+from management_state_store import update_document_state
 
 
 BASE_DIR = Path(__file__).resolve().parent
-STATE_FILE = BASE_DIR / "management_state.json"
 DOC_DIR_PATH = Path(DOC_DIR)
 
 
@@ -34,42 +36,45 @@ def _now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _load_state() -> dict:
-    if not STATE_FILE.exists():
-        return {}
-    try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _save_state(payload: dict) -> None:
-    temp_path = STATE_FILE.with_suffix(".tmp")
-    temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp_path.replace(STATE_FILE)
-
-
 def _update_document_state(storage_file_name: str, status: str, chunk_count: int | None = None, summary: str = "") -> None:
-    payload = _load_state()
-    documents = payload.get("documents")
-    if not isinstance(documents, list):
-        return
-    changed = False
-    for document in documents:
-        if document.get("storageFileName") != storage_file_name:
-            continue
-        document["status"] = status
-        if chunk_count is not None:
-            document["chunkCount"] = int(chunk_count)
-        if summary:
-            document["summary"] = summary
-        changed = True
-        break
-    if changed:
-        _save_state(payload)
+    update_document_state(storage_file_name, status, chunk_count=chunk_count, summary=summary)
+
+
+def _has_chinese_name(path: Path) -> bool:
+    return any("\u4e00" <= char <= "\u9fff" for char in path.stem)
+
+
+def _select_reindex_files(
+    all_files: list[Path],
+    *,
+    max_size_mb: float | None = None,
+    limit: int | None = None,
+    prefer_chinese: bool = False,
+) -> tuple[list[Path], list[Path]]:
+    max_size_bytes = None if max_size_mb is None else max(float(max_size_mb), 0.0) * 1024 * 1024
+    eligible: list[Path] = []
+    skipped: list[Path] = []
+    for path in all_files:
+        if max_size_bytes is not None and path.stat().st_size > max_size_bytes:
+            skipped.append(path)
+        else:
+            eligible.append(path)
+
+    if prefer_chinese:
+        eligible.sort(key=lambda path: (not _has_chinese_name(path), path.stat().st_size, path.name))
+    else:
+        eligible.sort(key=lambda path: path.name)
+
+    if limit is not None and limit > 0:
+        selected = eligible[:limit]
+        skipped.extend(eligible[limit:])
+    else:
+        selected = eligible
+    return selected, skipped
 
 
 def _print_es_counts() -> None:
+    es = None
     try:
         es = Elasticsearch(ES_HOST)
         body = {"size": 0, "aggs": {"docs": {"terms": {"field": "doc_name", "size": 100}}}}
@@ -79,13 +84,36 @@ def _print_es_counts() -> None:
             print(f"  {bucket['key']}: {bucket['doc_count']}")
     except Exception as exc:
         print(f"[WARN] 读取 ES 计数失败：{exc}")
+    finally:
+        if es is not None:
+            try:
+                es.close()
+            except Exception:
+                pass
 
 
-def main() -> int:
-    files = sorted(
+def main(
+    require_gpu: bool = False,
+    max_size_mb: float | None = None,
+    limit: int | None = None,
+    prefer_chinese: bool = False,
+) -> int:
+    if require_gpu and not torch.cuda.is_available():
+        print(f"[{_now()}] CUDA 不可用，已按 --require-gpu 要求停止重建。")
+        return 2
+    if require_gpu:
+        os.environ["AEROSPACE_RERANK_DEVICE"] = "cuda"
+
+    all_files = sorted(
         path
         for path in DOC_DIR_PATH.iterdir()
         if path.is_file() and path.suffix.lower() in {".pdf", ".docx"}
+    )
+    files, skipped_files = _select_reindex_files(
+        all_files,
+        max_size_mb=max_size_mb,
+        limit=limit,
+        prefer_chinese=prefer_chinese,
     )
     if not files:
         print(f"[{_now()}] 未找到可索引文档：{DOC_DIR_PATH}")
@@ -95,6 +123,13 @@ def main() -> int:
     print(f"[{_now()}] 开始逐个重建索引")
     print(f"文档目录：{DOC_DIR_PATH}")
     print(f"文档数量：{len(files)}")
+    if max_size_mb is not None:
+        print(f"大文件阈值：{max_size_mb:.1f} MB")
+    if limit is not None:
+        print(f"本轮数量限制：{limit}")
+    if prefer_chinese:
+        print("选择策略：中文文件名优先，其次按文件大小")
+    print(f"本轮跳过：{len(skipped_files)}")
     print("策略：逐个 add_document，不使用 build_index 的一次性全量汇总入库")
     print(f"嵌入模型：{EMBEDDING_MODEL} / dim={VECTOR_DIM}")
     print(f"重排模型：{RERANK_MODEL}")
@@ -112,8 +147,16 @@ def main() -> int:
         manager.reset_databases()
         clear_structural_records()
         print(f"[{_now()}] 索引重置完成")
+        for skipped in skipped_files:
+            _update_document_state(
+                skipped.name,
+                "READY",
+                chunk_count=0,
+                summary="本轮测试子集未入库",
+            )
     except Exception as exc:
         print(f"[{_now()}] 索引重置失败：{type(exc).__name__}: {exc}")
+        manager.close()
         return 2
 
     failures: list[tuple[str, str]] = []
@@ -151,6 +194,7 @@ def main() -> int:
         except KeyboardInterrupt:
             _update_document_state(file_path.name, "FAILED", summary="用户中断索引")
             print(f"\n[{_now()}] 用户中断，当前文档标记为 FAILED：{file_path.name}")
+            manager.close()
             return 130
         except Exception as exc:
             elapsed = time.time() - doc_started_at
@@ -175,9 +219,23 @@ def main() -> int:
         print("失败文档: 0")
     _print_es_counts()
     print("=" * 72)
+    manager.close()
     return 1 if failures else 0
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Rebuild the local aerospace retrieval index document by document.")
+    parser.add_argument("--require-gpu", action="store_true", help="Abort unless CUDA is available for embedding/reranking.")
+    parser.add_argument("--max-size-mb", type=float, default=None, help="Only index files up to this size; larger files are marked READY and skipped.")
+    parser.add_argument("--limit", type=int, default=None, help="Only index the first N selected files.")
+    parser.add_argument("--prefer-chinese", action="store_true", help="Prefer Chinese-named documents when selecting a limited subset.")
+    args = parser.parse_args()
     _configure_utf8_console()
-    raise SystemExit(main())
+    raise SystemExit(
+        main(
+            require_gpu=args.require_gpu,
+            max_size_mb=args.max_size_mb,
+            limit=args.limit,
+            prefer_chinese=args.prefer_chinese,
+        )
+    )

@@ -8,7 +8,7 @@ import time
 import warnings
 import json
 import logging
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -31,6 +31,23 @@ from elasticsearch import Elasticsearch, helpers
 from pymilvus import Collection, CollectionSchema, DataType, FieldSchema, connections, utility
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
+from aerospace_evidence_scores import calibrate_ranking_score, normalize_structural_score
+from aerospace_es_query_builder import (
+    AliasClauseProfile,
+    ArticleReferenceProfile,
+    CodeVariantProfile,
+    EsQueryPlan,
+    PrecisionHintProfile,
+    WeightedField,
+    build_alias_clauses,
+    build_article_reference_clauses,
+    build_code_variant_clauses,
+    build_precision_hint_clauses,
+    es_hit_to_channel_result,
+    match_clause,
+    match_phrase_clause,
+    terms_filter,
+)
 from aerospace_structure import (
     answer_structural_classification,
     answer_structural_count,
@@ -42,9 +59,38 @@ from aerospace_structure import (
     remove_structural_records,
     save_structural_records,
 )
+from aerospace_retrieval_contract import (
+    RetrievalContract,
+    apply_contract,
+    build_retrieval_contract,
+    code_query_variants,
+    contract_needs_multi_target_recall,
+)
+from aerospace_query_utils import compact_query_text, cross_lingual_query_terms, classify_query_intent
 
 warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+ES_REQUEST_TIMEOUT_SECONDS = max(_env_float("AEROSPACE_ES_REQUEST_TIMEOUT_SECONDS", 8.0), 0.5)
+ES_QUERY_TIMEOUT_SECONDS = max(_env_float("AEROSPACE_ES_QUERY_TIMEOUT_SECONDS", 6.0), 0.5)
+ES_SLOW_QUERY_SECONDS = max(_env_float("AEROSPACE_ES_SLOW_QUERY_SECONDS", 2.5), 0.1)
+PDF_PAGE_CACHE_MAX_ITEMS = max(_env_int("AEROSPACE_PDF_PAGE_CACHE_MAX_ITEMS", 8), 1)
+METADATA_CACHE_MAX_ITEMS = max(_env_int("AEROSPACE_METADATA_CACHE_MAX_ITEMS", 4096), 128)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -56,6 +102,40 @@ MILVUS_PORT = 19530
 MILVUS_COLLECTION = "aerospace_m3e_db"
 ES_HOST = "http://localhost:9200"
 ES_INDEX = "aerospace_kw_db"
+
+_MILVUS_CONNECTION_LOCK = threading.RLock()
+_MILVUS_CONNECTION_REFCOUNT = 0
+
+
+def _acquire_milvus_connection() -> None:
+    global _MILVUS_CONNECTION_REFCOUNT
+    with _MILVUS_CONNECTION_LOCK:
+        if not connections.has_connection("default"):
+            connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
+        _MILVUS_CONNECTION_REFCOUNT += 1
+
+
+def _release_milvus_connection() -> None:
+    global _MILVUS_CONNECTION_REFCOUNT
+    with _MILVUS_CONNECTION_LOCK:
+        _MILVUS_CONNECTION_REFCOUNT = max(_MILVUS_CONNECTION_REFCOUNT - 1, 0)
+        if _MILVUS_CONNECTION_REFCOUNT == 0 and connections.has_connection("default"):
+            connections.disconnect("default")
+
+
+def _lru_cache_get(cache: OrderedDict, key: str):
+    if key not in cache:
+        return None
+    cache.move_to_end(key)
+    return cache[key]
+
+
+def _lru_cache_put(cache: OrderedDict, key: str, value, max_items: int) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_items:
+        cache.popitem(last=False)
+
 
 MAX_CHUNK_SIZE = 960
 MAX_CHUNK_OVERLAP = 120
@@ -72,6 +152,36 @@ KW_RECALL = 120
 HEADING_RECALL = 40
 TABLE_RECALL = 20
 ARTICLE_RECALL = 40
+
+
+@dataclass(frozen=True)
+class RecallBudget:
+    vector: int = VEC_RECALL
+    keyword: int = KW_RECALL
+    heading: int = HEADING_RECALL
+    structure: int = HEADING_RECALL
+    article: int = ARTICLE_RECALL
+    table: int = TABLE_RECALL
+    target_document: int = HEADING_RECALL
+    alias_limit: int = 4
+    candidate_min: int = 60
+    candidate_max: int = 160
+    rerank_window: int = 50
+
+
+@dataclass(frozen=True)
+class FusionPolicy:
+    rrf_k: int = 60
+    score_weight: float = 0.16
+    channel_bonus: float = 0.012
+
+
+@dataclass(frozen=True)
+class RetrievalPolicy:
+    query_type: str
+    contract_intent: str
+    recall: RecallBudget = field(default_factory=RecallBudget)
+    fusion: FusionPolicy = field(default_factory=FusionPolicy)
 
 ARTICLE_LABEL_PATTERN = re.compile(r"(?:第\s*)?([0-9A-Za-z一二三四五六七八九十百千万]+(?:\.[0-9A-Za-z一二三四五六七八九十百千万]+)*)\s*条")
 SECTION_LABEL_PATTERN = re.compile(r"(?:第\s*)?([0-9A-Za-z一二三四五六七八九十百千万]+(?:\.[0-9A-Za-z一二三四五六七八九十百千万]+)*)\s*节")
@@ -114,7 +224,7 @@ INDEXED_STRUCTURAL_FIELDS = (
 
 
 def _compact_match_text(text: str) -> str:
-    return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9.]+", "", str(text or "").lower())
+    return compact_query_text(text)
 
 
 def _contains_any(text: str, terms: Tuple[str, ...]) -> bool:
@@ -135,6 +245,362 @@ def _doc_alias_keys(file_name: str) -> List[str]:
     }
     aliases = [alias for alias in variants if alias and len(alias) >= 4]
     return sorted(set(aliases), key=len, reverse=True)
+
+
+def _contract_target_doc_name(profile: dict) -> str:
+    contract = profile.get("retrieval_contract") or {}
+    synced_targets = contract.get("synced_target_doc_names") or []
+    if synced_targets:
+        return str(synced_targets[0] or "")
+    return str(profile.get("target_doc_name") or "")
+
+
+CODE_REFERENCE_PATTERN = re.compile(
+    r"\b(?:CCAR|AC|FAA|EASA|ATA|AMM|FIM|TSM|IPC|SRM)\s*[- ]?\s*[A-Za-z0-9.]+(?:[-. ]?[A-Za-z0-9]+)*\b",
+    re.I,
+)
+
+CCAR_PART_PATTERN = re.compile(r"^ccar(\d{2,4})(?:r\d+)?$", re.I)
+
+
+def _contract_has_synced_hard_target(profile: dict) -> bool:
+    contract = profile.get("retrieval_contract") or {}
+    return bool(contract.get("hard_target") and contract.get("synced_target_doc_names"))
+
+
+def _contract_needs_code_lexical_recall(profile: dict) -> bool:
+    contract = profile.get("retrieval_contract") or {}
+    return bool(contract.get("query_codes")) and not _contract_has_synced_hard_target(profile)
+
+
+def _strip_contract_identity_terms(value: str, profile: dict) -> str:
+    text = clean_block_text(value)
+    if not text or not _contract_has_synced_hard_target(profile):
+        return text
+
+    contract = profile.get("retrieval_contract") or {}
+    text = CODE_REFERENCE_PATTERN.sub(" ", text)
+    for code in contract.get("query_codes", []) or []:
+        for variant in code_query_variants(str(code)):
+            if variant:
+                text = re.sub(re.escape(variant), " ", text, flags=re.I)
+
+    for target in contract.get("targets", []) or []:
+        if not isinstance(target, dict):
+            continue
+        for raw in (target.get("doc_name"), Path(str(target.get("doc_name") or "")).stem, target.get("title")):
+            raw_text = clean_block_text(str(raw or ""))
+            if raw_text:
+                text = text.replace(raw_text, " ")
+
+    text = re.sub(r"[《》\"'“”‘’（）()【】\[\]]+", " ", text)
+    text = clean_block_text(text)
+    text = re.sub(r"^(?:中|中的|里|里的|关于|针对|对)\s*", "", text)
+    return clean_block_text(text) or clean_block_text(value)
+
+
+def _contract_query_aliases(query: str, profile: dict) -> List[str]:
+    return _build_query_aliases(_strip_contract_identity_terms(query, profile))
+
+
+def _contract_recall_aliases(query: str, profile: dict) -> List[str]:
+    aliases = _contract_query_aliases(query, profile)
+    for term in _cross_lingual_query_terms(query):
+        if term and term not in aliases:
+            aliases.append(term)
+    if not _contract_needs_code_lexical_recall(profile):
+        return aliases
+
+    contract = profile.get("retrieval_contract") or {}
+    seen = {alias for alias in aliases if alias}
+    for code in contract.get("query_codes", []) or []:
+        for variant in code_query_variants(str(code)):
+            if variant and variant not in seen:
+                seen.add(variant)
+                aliases.append(variant)
+    return aliases
+
+
+def _clean_precision_hints_for_contract(query: str, profile: dict) -> None:
+    if not _contract_has_synced_hard_target(profile):
+        return
+    hints = profile.get("precision_hints") or {}
+    if not hints:
+        return
+
+    for key in ("required_terms", "subject_terms", "title_keyphrases"):
+        cleaned_values: List[str] = []
+        for raw in hints.get(key, []) or []:
+            cleaned = _strip_contract_identity_terms(str(raw or ""), profile)
+            if not cleaned or len(_compact_match_text(cleaned)) < 2:
+                continue
+            if cleaned not in cleaned_values:
+                cleaned_values.append(cleaned)
+        hints[key] = cleaned_values
+
+    hints["compact_query"] = _compact_match_text(_strip_contract_identity_terms(query, profile))
+
+
+def _contract_target_doc_names(profile: dict) -> List[str]:
+    contract = profile.get("retrieval_contract") or {}
+    contract_names = contract.get("hard_target_doc_names") if contract.get("hard_target") else contract.get("synced_target_doc_names")
+    names = [str(name or "") for name in contract_names or [] if name]
+    if not contract.get("allow_multi_doc") and profile.get("target_doc_name") and profile["target_doc_name"] not in names:
+        names.append(str(profile["target_doc_name"]))
+    return names
+
+
+def _ccar_code_article_variants(profile: dict) -> List[str]:
+    contract = profile.get("retrieval_contract") or {}
+    variants: List[str] = []
+    for code in contract.get("query_codes", []) or []:
+        match = CCAR_PART_PATTERN.match(str(code or ""))
+        if not match:
+            continue
+        part = match.group(1)
+        if part not in variants:
+            variants.append(part)
+    return variants
+
+
+def _contract_focus_terms(profile: dict) -> List[str]:
+    contract = profile.get("retrieval_contract") or {}
+    return [str(term or "") for term in contract.get("focus_terms", []) if term]
+
+
+def _cross_lingual_query_terms(query: str) -> List[str]:
+    return list(cross_lingual_query_terms(query))
+
+
+CONTRACT_INTENT_QUERY_TYPE = {
+    "article_lookup": "article_lookup",
+    "procedure_or_method": "procedure",
+    "definition_or_explanation": "concept_explanation",
+    "comparison": "concept_explanation",
+}
+
+
+RECALL_BUDGET_BY_INTENT: Dict[str, RecallBudget] = {
+    "article_lookup": RecallBudget(vector=72, keyword=96, heading=56, structure=72, article=96, table=16, target_document=72, candidate_min=50, candidate_max=130, rerank_window=42),
+    "count": RecallBudget(vector=48, keyword=72, heading=72, structure=96, article=72, table=8, target_document=64, alias_limit=3, candidate_min=40, candidate_max=110, rerank_window=36),
+    "table": RecallBudget(vector=96, keyword=112, heading=48, structure=56, article=32, table=80, target_document=72, candidate_min=60, candidate_max=150, rerank_window=50),
+    "requirement": RecallBudget(vector=112, keyword=128, heading=56, structure=72, article=64, table=24, target_document=72, candidate_min=60, candidate_max=160, rerank_window=50),
+    "procedure_or_method": RecallBudget(vector=112, keyword=112, heading=56, structure=64, article=48, table=24, target_document=64, candidate_min=60, candidate_max=150, rerank_window=50),
+    "definition_or_explanation": RecallBudget(vector=96, keyword=80, heading=64, structure=72, article=48, table=12, target_document=56, candidate_min=50, candidate_max=130, rerank_window=42),
+    "comparison": RecallBudget(vector=144, keyword=128, heading=72, structure=80, article=56, table=20, target_document=72, alias_limit=6, candidate_min=80, candidate_max=180, rerank_window=60),
+    "general": RecallBudget(),
+}
+
+
+def _policy_recall_budget(profile: dict) -> RecallBudget:
+    contract = profile.get("retrieval_contract") or {}
+    intent = str(contract.get("intent") or profile.get("query_type") or "general")
+    budget = RECALL_BUDGET_BY_INTENT.get(intent) or RECALL_BUDGET_BY_INTENT["general"]
+    if contract.get("hard_target") and contract.get("synced_target_doc_names"):
+        return RecallBudget(
+            vector=max(48, int(budget.vector * 0.7)),
+            keyword=budget.keyword,
+            heading=budget.heading,
+            structure=budget.structure,
+            article=budget.article,
+            table=budget.table,
+            target_document=max(budget.target_document, 80),
+            alias_limit=budget.alias_limit,
+            candidate_min=budget.candidate_min,
+            candidate_max=min(budget.candidate_max, 140),
+            rerank_window=min(budget.rerank_window, 50),
+        )
+    return budget
+
+
+def _build_retrieval_policy(profile: dict) -> RetrievalPolicy:
+    contract = profile.get("retrieval_contract") or {}
+    intent = str(contract.get("intent") or "general")
+    rrf_k = int(profile.get("rrf_k", 60))
+    if intent == "article_lookup":
+        rrf_k = min(rrf_k, 42)
+    elif intent == "comparison":
+        rrf_k = max(rrf_k, 68)
+    return RetrievalPolicy(
+        query_type=str(profile.get("query_type") or "general"),
+        contract_intent=intent,
+        recall=_policy_recall_budget(profile),
+        fusion=FusionPolicy(rrf_k=rrf_k),
+    )
+
+
+def _align_profile_with_contract_intent(profile: dict, contract: RetrievalContract) -> None:
+    profile["contract_intent"] = contract.intent
+    mapped_type = CONTRACT_INTENT_QUERY_TYPE.get(contract.intent)
+    if mapped_type and profile.get("query_type") == "general":
+        profile["query_type"] = mapped_type
+    if contract.intent in {"article_lookup", "count", "table"}:
+        profile["structure_first"] = True
+
+
+def _contract_needs_multi_target_recall(contract: RetrievalContract) -> bool:
+    return contract_needs_multi_target_recall(contract)
+
+
+def _contracted_sources_or_none(contract: RetrievalContract, sources: Iterable[dict], *, limit: int = QA_TOP_K) -> Optional[List[dict]]:
+    contracted = apply_contract(contract, sources, keep_failed_when_no_hard_constraints=True)
+    return contracted[:limit] if contracted else None
+
+
+ARTICLE_PRECISION_PROFILE = PrecisionHintProfile(
+    target_doc_boost=2.2,
+    preferred_article_boost=12.0,
+    preferred_article_label_boost=9.5,
+    related_article_boost=3.2,
+    preferred_section_boost=8.0,
+    preferred_section_title_boost=3.5,
+    required_term_fields=(WeightedField("retrieval_text", 3.4), WeightedField("content", 2.8)),
+)
+ARTICLE_REFERENCE_PROFILE = ArticleReferenceProfile(
+    article_id_boost=8.0,
+    article_label_term_boost=8.8,
+    article_label_phrase_fields=(
+        WeightedField("section_title", 6.2),
+        WeightedField("heading_text", 6.8),
+        WeightedField("scope_anchor", 7.2),
+        WeightedField("heading_path_text", 6.4),
+    ),
+    normalized_heading_boost=7.2,
+    role_boost=1.8,
+)
+ARTICLE_ALIAS_PROFILE = AliasClauseProfile(
+    phrase_fields=(
+        WeightedField("scope_anchor", 5.4),
+        WeightedField("heading_path_text", 5.0),
+        WeightedField("section_title", 4.5),
+        WeightedField("heading_text", 4.9),
+        WeightedField("clause_path", 3.8),
+    ),
+    decay_step=0.0,
+    decay_floor=1.0,
+)
+CODE_LEXICAL_PROFILE = CodeVariantProfile(
+    fields=(
+        WeightedField("retrieval_text", 3.8),
+        WeightedField("content", 3.2),
+        WeightedField("doc_name", 2.8),
+    )
+)
+KEYWORD_ALIAS_PROFILE = AliasClauseProfile(
+    multi_match_fields=(
+        "content^1.2",
+        "retrieval_text^1.4",
+        "scope_anchor^3.8",
+        "heading_path_text^2.8",
+        "heading_text^2.6",
+        "section_title^2.2",
+        "parent_heading^1.3",
+        "highlight_text^1.4",
+        "doc_name^0.6",
+        "article_label^3.0",
+        "clause_path^2.0",
+    ),
+    multi_match_boost=1.0,
+    phrase_fields=(
+        WeightedField("content", 3.5),
+        WeightedField("scope_anchor", 5.0),
+        WeightedField("heading_path_text", 4.8),
+        WeightedField("heading_text", 4.2),
+        WeightedField("clause_path", 4.4),
+    ),
+    decay_step=0.14,
+    decay_floor=0.58,
+    exact_section_boost=4.8,
+)
+HEADING_ALIAS_PROFILE = AliasClauseProfile(
+    phrase_fields=(
+        WeightedField("scope_anchor", 6.4),
+        WeightedField("heading_path_text", 5.6),
+        WeightedField("heading_text", 6.0),
+        WeightedField("section_title", 5.0),
+        WeightedField("clause_path", 4.6),
+    ),
+    match_fields=(WeightedField("heading_text", 2.5),),
+    decay_step=0.14,
+    decay_floor=0.58,
+)
+STRUCTURE_PRECISION_PROFILE = PrecisionHintProfile(
+    target_doc_boost=2.8,
+    preferred_article_boost=13.0,
+    preferred_article_label_boost=10.0,
+    preferred_article_scope_boost=8.5,
+    related_article_boost=3.4,
+    preferred_section_boost=8.8,
+    preferred_section_title_boost=4.0,
+    required_term_fields=(
+        WeightedField("scope_anchor", 5.8),
+        WeightedField("heading_path_text", 4.8),
+        WeightedField("retrieval_text", 3.8),
+    ),
+)
+STRUCTURE_REFERENCE_PROFILE = ArticleReferenceProfile(
+    article_id_boost=8.5,
+    article_label_term_boost=9.0,
+    article_label_phrase_fields=(
+        WeightedField("scope_anchor", 7.8),
+        WeightedField("heading_path_text", 6.8),
+        WeightedField("section_title", 6.4),
+    ),
+    normalized_heading_boost=8.2,
+    role_boost=2.3,
+)
+STRUCTURE_ALIAS_PROFILE = AliasClauseProfile(
+    multi_match_fields=(
+        "scope_anchor^4.4",
+        "heading_path_text^3.8",
+        "section_title^3.5",
+        "heading_text^3.5",
+        "article_label^4.0",
+        "clause_path^2.8",
+        "highlight_text^1.4",
+        "content^0.9",
+    ),
+    multi_match_boost=1.0,
+    phrase_fields=(
+        WeightedField("scope_anchor", 7.0),
+        WeightedField("heading_path_text", 6.2),
+        WeightedField("section_title", 5.8),
+        WeightedField("heading_text", 5.6),
+        WeightedField("clause_path", 4.6),
+    ),
+    decay_step=0.12,
+    decay_floor=0.58,
+)
+TABLE_PRECISION_PROFILE = PrecisionHintProfile(
+    target_doc_boost=2.4,
+    preferred_article_boost=6.0,
+    preferred_section_boost=4.0,
+    preferred_section_title_boost=3.6,
+    required_term_fields=(WeightedField("content", 2.4), WeightedField("retrieval_text", 2.2)),
+)
+TABLE_ALIAS_PROFILE = AliasClauseProfile(
+    phrase_fields=(
+        WeightedField("section_title", 4.0),
+        WeightedField("heading_path_text", 3.6),
+        WeightedField("content", 2.6),
+    ),
+    match_fields=(WeightedField("content", 1.6),),
+    decay_step=0.1,
+    decay_floor=0.68,
+    limit=8,
+)
+TARGET_DOC_ALIAS_PROFILE = AliasClauseProfile(
+    phrase_fields=(
+        WeightedField("scope_anchor", 5.4),
+        WeightedField("heading_path_text", 4.6),
+        WeightedField("section_title", 4.0),
+        WeightedField("content", 2.0),
+    ),
+    match_fields=(WeightedField("retrieval_text", 1.8),),
+    decay_step=0.08,
+    decay_floor=0.55,
+    limit=12,
+)
 
 
 def _extract_title_keyphrases(query: str, subject: str = "") -> List[str]:
@@ -206,6 +672,8 @@ def _extract_title_keyphrases(query: str, subject: str = "") -> List[str]:
 def _definition_term_from_query(query: str) -> str:
     compact = _compact_match_text(query)
     if not compact:
+        return ""
+    if re.search(r"[A-Za-z]", query) and not any(token in compact for token in ("定义", "是指", "含义", "术语")):
         return ""
     for suffix in ("的定义是什么", "定义是什么", "的定义", "是什么"):
         if compact.endswith(suffix) and len(compact) > len(suffix):
@@ -419,6 +887,11 @@ def infer_query_precision_hints(query: str) -> dict:
                         if prefix and prefix not in hints["forbidden_terms"]:
                             hints.setdefault("subject_modifiers", []).append(prefix)
     hints["title_keyphrases"] = _extract_title_keyphrases(query, subject)
+    for term in _cross_lingual_query_terms(query):
+        if term not in hints["intent_terms"]:
+            hints["intent_terms"].append(term)
+        if term not in hints["title_keyphrases"]:
+            hints["title_keyphrases"].append(term)
     hints["compact_query"] = compact
     return hints
 
@@ -1035,27 +1508,20 @@ def analyze_query_intent(query: str) -> dict:
     normalized = text.lower()
     query_signature = _build_query_signature(text)
     target_roles = query_signature["target_roles"]
-    classification_like = (
-        any(token in text for token in ("类别", "分类", "分为", "分成", "包括", "哪几类", "哪两类", "哪些类型"))
-        and any(token in text for token in ("适航证", "合格证", "认可证", "批准标签", "证书", "特许飞行证"))
-    )
-    article_like = bool(
-        query_signature.get("article_id_variants")
-        or re.search(r"(?:第\s*)?[0-9A-Za-z一二三四五六七八九十百千万]+(?:\.[0-9A-Za-z一二三四五六七八九十百千万]+)*\s*条", text)
-        or re.search(r"(?<![A-Za-z0-9.])\d+\.\d+(?:\.\d+)*(?![A-Za-z0-9.])", text)
-        or re.search(r"\b(?:ccar|ata|amm|fim|tsm|ipc|srm)\b", normalized)
-        or classification_like
-        or any(token in text for token in ("颁发条件", "颁发要求", "签发条件", "申请条件", "批准条件"))
-    )
-    fault_like = any(token in text for token in ("故障", "异常", "告警", "失效", "不工作", "排查", "原因", "报警"))
-    procedure_like = any(token in text for token in ("步骤", "如何", "怎么", "流程", "更换", "检查", "操作", "procedure", "程序", "颁发程序"))
-    concept_like = any(token in text for token in ("是什么", "含义", "定义", "区别", "作用", "概念"))
-    structure_first = bool(
-        article_like
-        or "适用范围" in text
-        or "effective_date" in target_roles
+
+    # Shared intent as single source of truth for the flags
+    decision = classify_query_intent(query)
+    article_like = decision.article_like
+    # Override: query_signature's article_id_variants also forces article_lookup
+    if query_signature.get("article_id_variants"):
+        article_like = True
+    fault_like = decision.fault_like
+    procedure_like = decision.procedure_like
+    concept_like = decision.concept_like
+    classification_like = decision.classification_like
+    structure_first = decision.structure_first or bool(
+        "effective_date" in target_roles
         or "definition" in target_roles
-        or classification_like
         or re.search(r"第\s*[0-9一二三四五六七八九十百千]+\s*章", text)
         or re.search(r"第\s*[0-9一二三四五六七八九十百千]+\s*节", text)
     )
@@ -1204,6 +1670,12 @@ def _compact_section_label(text: str) -> str:
     return cleaned[:72].rstrip(" ：:;；，,")
 
 
+def _normalize_soft_hyphen_linebreaks(text: str) -> str:
+    value = str(text or "").replace("\u00ad", "")
+    value = re.sub(r"([A-Za-z])-\s+([A-Za-z])", r"\1\2", value)
+    return clean_block_text(value)
+
+
 def _restore_article_reference(text: str, metadata: dict) -> str:
     cleaned = clean_block_text(text).strip(" ：:;；，,")
     if not cleaned:
@@ -1232,7 +1704,7 @@ def _restore_article_reference(text: str, metadata: dict) -> str:
 
 
 def _split_text_candidates(text: str) -> List[str]:
-    body = clean_block_text(re.sub(r"^\[SECTION\]\s*", "", text or ""))
+    body = _normalize_soft_hyphen_linebreaks(re.sub(r"^\[SECTION\]\s*", "", text or ""))
     if not body:
         return []
 
@@ -1245,6 +1717,20 @@ def _split_text_candidates(text: str) -> List[str]:
             return
         seen.add(cleaned)
         candidates.append(cleaned[:180])
+
+    heading_patterns = (
+        r"\b(?:PART|CHAPTER|SECTION|APPENDIX)\s+[A-Z0-9IVXLC]+(?:[-.]\s*|\s+)[A-Z][A-Z0-9 /&'(),-]{3,90}",
+        r"\b(?:Part|Chapter|Section|Appendix)\s+[A-Z0-9IVXLC]+(?:[-.]\s*|\s+)[A-Z][A-Za-z0-9 /&'(),-]{3,90}",
+        r"\b[A-Z][A-Z0-9 /&'(),-]{6,70}\b(?=\s+[A-Z][a-z])",
+        r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,8}\.",
+    )
+    for pattern in heading_patterns:
+        for match in re.finditer(pattern, body):
+            push(match.group(0).strip(" .:-"))
+            if len(candidates) >= 12:
+                break
+        if len(candidates) >= 12:
+            break
 
     for line in body.splitlines():
         line = clean_block_text(line)
@@ -1265,7 +1751,54 @@ def _split_text_candidates(text: str) -> List[str]:
     return candidates
 
 
+def _section_title_candidate_score(value: str, metadata: dict, content: str) -> float:
+    label = _compact_section_label(_restore_article_reference(value, metadata))
+    if not label:
+        return -10.0
+
+    compact = _compact_match_text(label)
+    if not compact:
+        return -10.0
+
+    score = 0.0
+    if label == clean_block_text(metadata.get("section_title", "")):
+        score += 0.55
+    if label == clean_block_text(metadata.get("heading_text", "")):
+        score += 0.45
+    if re.search(r"第\s*[0-9A-Za-z一二三四五六七八九十百千万.]+\s*[章节条]", label):
+        score += 1.3
+    if re.search(r"\b(?:part|chapter|section|appendix)\s+[a-z0-9ivxlc]+", label, re.I):
+        score += 1.0
+    if re.match(r"^[0-9A-Za-z一二三四五六七八九十百千万]+(?:[-.、．]\d+)*[.、．)]?\s+\S+", label):
+        score += 0.55
+    if 14 <= len(label) <= 120:
+        score += 0.35
+    elif len(label) < 8:
+        score -= 1.6
+    elif len(label) > 150:
+        score -= 0.45
+
+    if _looks_like_toc_or_index_listing(label):
+        score -= 2.0
+    if re.search(r"[-‐‑‒–—_]{4,}", label):
+        score -= 0.65
+    if re.search(r"[A-Za-z]{1,8}\s*[\u00ad-]$", label):
+        score -= 1.4
+    if re.match(r"^[a-z]{1,3}\s+[a-z]{1,8}[\u00ad-]?$", label):
+        score -= 1.7
+    if compact in _compact_match_text(Path(str(metadata.get("doc_name") or "")).stem):
+        score -= 1.0
+    if label and label[0].islower() and not re.search(r"\b(?:part|chapter|section|appendix)\b", label, re.I):
+        score -= 0.45
+
+    content_compact = _compact_match_text(content[:900])
+    if compact and compact in content_compact:
+        score += 0.15
+    return round(score, 6)
+
+
 def _derive_section_title(metadata: dict, content: str) -> str:
+    scored: List[Tuple[float, str]] = []
     for value in (
         metadata.get("section_title", ""),
         metadata.get("heading_text", ""),
@@ -1275,12 +1808,17 @@ def _derive_section_title(metadata: dict, content: str) -> str:
     ):
         label = _compact_section_label(_restore_article_reference(value, metadata))
         if label:
-            return label
+            scored.append((_section_title_candidate_score(label, metadata, content), label))
 
     for candidate in _split_text_candidates(content):
         label = _compact_section_label(_restore_article_reference(candidate, metadata))
         if label:
-            return label
+            scored.append((_section_title_candidate_score(label, metadata, content), label))
+
+    if scored:
+        scored.sort(key=lambda item: item[0], reverse=True)
+        if scored[0][0] >= 0.2:
+            return scored[0][1]
 
     return _extract_highlight_text(content)
 
@@ -1347,6 +1885,16 @@ def _query_alignment_score(query: str, evidence: dict, profile: dict) -> float:
         score += 0.18
     if evidence.get("chunk_role") == "effective_date" and "effective_date" in profile.get("target_roles", []):
         score += 0.65
+    focus_terms = _contract_focus_terms(profile)
+    if focus_terms:
+        focus_haystack = _compact_match_text(combined)
+        focus_scores = [
+            max(_token_overlap_score(term, focus_haystack), _ngram_similarity(term, focus_haystack))
+            for term in focus_terms
+            if term
+        ]
+        if focus_scores:
+            score += 0.55 * (sum(focus_scores) / len(focus_scores))
     target_doc_name = profile.get("target_doc_name", "")
     if target_doc_name:
         if evidence.get("doc_name") == target_doc_name:
@@ -1355,6 +1903,140 @@ def _query_alignment_score(query: str, evidence: dict, profile: dict) -> float:
             score -= 0.7
 
     return round(score, 6)
+
+
+def _looks_like_toc_or_index_listing(text: str) -> bool:
+    cleaned = clean_block_text(text)
+    if not cleaned:
+        return False
+    lower = cleaned.lower()
+    compact = _compact_match_text(cleaned)
+
+    if any(token in compact for token in ("tableofcontents", "figurepage", "目录")):
+        return True
+    if len(re.findall(r"\bsection\s+\d+\.?", lower)) >= 3:
+        return True
+    if len(re.findall(r"\b(?:figure|appendix|section)\s+[a-z]?\d+(?:[-.]\d+)?", lower)) >= 5:
+        return True
+
+    dash_runs = len(re.findall(r"[-‐‑‒–—_]{5,}", cleaned))
+    numbered_leaders = len(
+        re.findall(
+            r"\b(?:[a-z]?\d{1,3}(?:[-–—.]\d{1,3})?|section\s+\d+|appendix\s+[a-z])\.?\s+.{2,90}[-‐‑‒–—_]{5,}\s*[ivx\d]{1,4}\b",
+            lower,
+        )
+    )
+    if dash_runs >= 5 and numbered_leaders >= 2:
+        return True
+    if dash_runs >= 9:
+        return True
+
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    short_entry_lines = [
+        line
+        for line in lines
+        if len(line) <= 140 and re.search(r"[-‐‑‒–—_]{4,}\s*[ivx\d]{1,4}\s*$", line.lower())
+    ]
+    return len(short_entry_lines) >= 3
+
+
+def _front_matter_penalty(metadata: dict, content: str, profile: dict) -> float:
+    text = clean_block_text(
+        "\n".join(
+            part
+            for part in [
+                metadata.get("section_title", ""),
+                metadata.get("heading_text", ""),
+                metadata.get("title", ""),
+                metadata.get("label", ""),
+                metadata.get("structural_path", ""),
+                metadata.get("scope_anchor", ""),
+                content[:500],
+            ]
+            if part
+        )
+    )
+    compact = _compact_match_text(text)
+    if not compact:
+        return 0.0
+
+    penalty = 0.0
+    if _looks_like_toc_or_index_listing(text):
+        penalty += 0.72
+    if any(token in compact for token in ("preface", "contents", "acknowledgment", "figurepage", "tableofcontents", "目录", "前言", "封面")):
+        penalty += 0.28
+    if any(
+        token in compact
+        for token in (
+            "advisorycircularfeedbackform",
+            "feedbackform",
+            "relatedmaterial",
+            "bibliography",
+            "appendixa",
+            "appendixb",
+            "contactus",
+            "recommendparagraph",
+            "submittedby",
+            "参考文献",
+            "参考资料",
+            "附录",
+            "反馈表",
+            "联系方式",
+        )
+    ):
+        penalty += 0.42
+    elif "references" in compact and len(re.findall(r"\b(?:available at|retrieved from|https?://|www\.|\(\d{4}\)|\d{4}\.)", text, flags=re.I)) >= 3:
+        penalty += 0.42
+
+    try:
+        page_number = int(metadata.get("page_number") or 1)
+    except Exception:
+        page_number = 1
+    if page_number <= 5 and profile.get("query_type") in {"procedure", "fault_diagnosis", "general"}:
+        if any(token in compact for token in ("contents", "figurepage", "section1section2", "preface", "acknowledgment")):
+            penalty += 0.25
+    try:
+        page_count = int(metadata.get("page_count") or 0)
+    except Exception:
+        page_count = 0
+    if page_count and page_number >= max(page_count - 1, 1):
+        if any(token in compact for token in ("feedbackform", "submittedby", "recommendparagraph", "contact", "references", "参考文献", "反馈表")):
+            penalty += 0.28
+
+    if len(compact) < 24:
+        penalty += 0.12
+
+    source_type = str(metadata.get("source_type") or "").lower()
+    if source_type.startswith("structural"):
+        return min(1.35, penalty)
+    return min(1.15, penalty)
+
+
+def _looks_like_reference_material(metadata: dict, content: str) -> bool:
+    text = clean_block_text(
+        "\n".join(
+            str(part or "")
+            for part in (
+                metadata.get("section_title", ""),
+                metadata.get("highlight_text", ""),
+                metadata.get("heading", ""),
+                metadata.get("heading_text", ""),
+                metadata.get("structural_path", ""),
+                content[:900],
+            )
+            if part
+        )
+    )
+    compact = _compact_match_text(text)
+    if not compact:
+        return False
+    if any(token in compact for token in ("advisorycircularfeedbackform", "feedbackform", "submittedby", "recommendparagraph", "参考文献", "反馈表")):
+        return True
+    if any(token in compact for token in ("appendixa", "relatedmaterial", "bibliography", "参考资料", "附录")):
+        return True
+    citation_hits = len(re.findall(r"\b(?:available at|retrieved from|https?://|www\.|doi:|\(\d{4}\)|\d{4}\.)", text, flags=re.I))
+    short_numbered_refs = len(re.findall(r"(?:^|\s)\d{1,2}\.\s+[A-Z][A-Za-z .,'’&()-]{12,}\.\s*(?:\(\d{4}\)|\d{4}\.)", text))
+    return citation_hits >= 3 or short_numbered_refs >= 3 or ("references" in compact and citation_hits >= 2)
 
 
 def _row_article_number(row: dict) -> str:
@@ -1626,6 +2308,12 @@ def _precision_hint_score(row: dict, profile: dict, fallback: str = "", structur
         score += 0.8 if structural else 0.35
     elif route == "method" and semantic_role in {"requirement", "classification", "scope", "procedure"}:
         score += 0.65 if structural else 0.28
+    elif route == "time_limit":
+        time_haystack = fallback or _row_precision_haystack(row)
+        if any(token in time_haystack for token in ("小时", "分钟", "日内", "工作日", "个工作日", "时限")):
+            score += 1.5 if structural else 0.55
+        if any(token in time_haystack for token in ("法律责任", "罚款", "责令限期改正", "逾期不改正")):
+            score -= 1.8 if structural else 0.7
 
     score += _route_title_action_score(row, hints, structural=structural)
 
@@ -2888,11 +3576,31 @@ def get_reranker():
 
 class DualDBManager:
     def __init__(self):
-        if connections.has_connection("default"):
-            connections.disconnect("default")
-        connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
-        self.es_client = Elasticsearch(ES_HOST)
-        self.embedder = None
+        _acquire_milvus_connection()
+        self._closed = False
+        try:
+            self.es_client = Elasticsearch(ES_HOST)
+            self.embedder = None
+        except Exception:
+            self._closed = True
+            _release_milvus_connection()
+            raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self.es_client.close()
+        except Exception:
+            logger.debug("Elasticsearch client close failed", exc_info=True)
+        _release_milvus_connection()
+
+    def __enter__(self) -> "DualDBManager":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
 
     def _get_embedder(self):
         if self.embedder is None:
@@ -3022,9 +3730,10 @@ class DualDBManager:
 
     def _remove_doc_from_milvus(self, collection: Collection, doc_name: str):
         try:
-            response = self.es_client.search(
+            response = self.es_client.options(request_timeout=ES_REQUEST_TIMEOUT_SECONDS).search(
                 index=ES_INDEX,
                 body={"query": {"term": {"doc_name": doc_name}}, "_source": ["chunk_id"], "size": 10000},
+                timeout=f"{math.ceil(ES_QUERY_TIMEOUT_SECONDS)}s",
             )
             chunk_ids = [hit["_source"]["chunk_id"] for hit in response["hits"]["hits"]]
             if chunk_ids:
@@ -3230,17 +3939,58 @@ class DualDBManager:
 
 class HybridSearch:
     def __init__(self, hyde_llm_call: Optional[Callable[[str, str], str]] = None):
-        if connections.has_connection("default"):
-            connections.disconnect("default")
-        connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
-        self.es_client = Elasticsearch(ES_HOST)
-        self.milvus_coll = Collection(MILVUS_COLLECTION)
-        self.milvus_coll.load()
-        self.reranker = get_reranker()
-        self.embedder = get_embedder()
-        self.hyde_llm_call = hyde_llm_call
-        self._pdf_page_cache: Dict[str, dict] = {}
-        self._metadata_cache: Dict[str, dict] = {}
+        _acquire_milvus_connection()
+        self._closed = False
+        self.es_client = None
+        try:
+            self.es_client = Elasticsearch(ES_HOST)
+            self.milvus_coll = Collection(MILVUS_COLLECTION)
+            self.milvus_coll.load()
+            self.reranker = get_reranker()
+            self.embedder = get_embedder()
+            self.hyde_llm_call = hyde_llm_call
+            self._pdf_page_cache: OrderedDict[str, dict] = OrderedDict()
+            self._metadata_cache: OrderedDict[str, dict] = OrderedDict()
+            self._es_stats_lock = threading.Lock()
+            self._es_channel_stats: Dict[str, dict] = defaultdict(
+                lambda: {
+                    "calls": 0,
+                    "failures": 0,
+                    "hits": 0,
+                    "total_elapsed_seconds": 0.0,
+                    "max_elapsed_seconds": 0.0,
+                    "last_elapsed_seconds": 0.0,
+                    "last_error": "",
+                }
+            )
+        except Exception:
+            self._closed = True
+            try:
+                if self.es_client is not None:
+                    self.es_client.close()
+            except Exception:
+                logger.debug("Elasticsearch client close failed", exc_info=True)
+            _release_milvus_connection()
+            raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._pdf_page_cache.clear()
+        self._metadata_cache.clear()
+        try:
+            if self.es_client is not None:
+                self.es_client.close()
+        except Exception:
+            logger.debug("Elasticsearch client close failed", exc_info=True)
+        _release_milvus_connection()
+
+    def __enter__(self) -> "HybridSearch":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
 
     def _resolve_doc_path(self, doc_name: str) -> Optional[str]:
         if not doc_name:
@@ -3265,8 +4015,8 @@ class HybridSearch:
         return None
 
     def _load_pdf_page_cache(self, file_path: str) -> dict:
-        cached = self._pdf_page_cache.get(file_path)
-        if cached:
+        cached = _lru_cache_get(self._pdf_page_cache, file_path)
+        if cached is not None:
             return cached
 
         pages = []
@@ -3282,7 +4032,7 @@ class HybridSearch:
                 )
             payload = {"page_count": document.page_count, "pages": pages}
 
-        self._pdf_page_cache[file_path] = payload
+        _lru_cache_put(self._pdf_page_cache, file_path, payload, PDF_PAGE_CACHE_MAX_ITEMS)
         return payload
 
     def _find_pdf_by_query_reference(self, query: str) -> Optional[str]:
@@ -3388,6 +4138,68 @@ class HybridSearch:
             "chunk_role": "text",
             "normalized_heading": _normalize_heading_value(label),
         }
+
+    def _build_retrieval_profile(self, query: str, contract: Optional[RetrievalContract] = None) -> Tuple[dict, RetrievalContract]:
+        contract = contract or build_retrieval_contract(query)
+        profile = analyze_query_intent(query)
+        profile["retrieval_contract"] = contract.to_dict()
+        _align_profile_with_contract_intent(profile, contract)
+        multi_target_recall = _contract_needs_multi_target_recall(contract)
+        if multi_target_recall:
+            profile.pop("target_doc_name", None)
+            profile.pop("target_doc_is_explicit", None)
+            profile.setdefault("precision_hints", {})["target_doc_name"] = ""
+        if contract.block_reason:
+            profile["contract_block_reason"] = contract.block_reason
+            profile["retrieval_policy"] = _build_retrieval_policy(profile)
+            return profile, contract
+
+        if contract.synced_target_doc_names and not multi_target_recall and (contract.hard_target or len(contract.synced_target_doc_names) == 1):
+            target_doc_name = contract.synced_target_doc_names[0]
+            profile["target_doc_name"] = target_doc_name
+            profile["target_doc_is_explicit"] = bool(contract.hard_target or len(contract.synced_target_doc_names) == 1)
+            profile.setdefault("precision_hints", {})["target_doc_name"] = target_doc_name
+            _clean_precision_hints_for_contract(query, profile)
+            if contract.hard_target:
+                profile["retrieval_policy"] = _build_retrieval_policy(profile)
+                return profile, contract
+
+        target_doc_name = "" if profile.get("target_doc_name") or contract.synced_target_doc_names else self._find_doc_name_by_query_reference(query)
+        if target_doc_name:
+            profile["target_doc_name"] = target_doc_name
+            profile["target_doc_is_explicit"] = True
+            profile.setdefault("precision_hints", {})["target_doc_name"] = target_doc_name
+        elif not profile.get("target_doc_name") and not contract.synced_target_doc_names:
+            inferred_doc_name = self._infer_target_doc_from_code(profile) or self._infer_target_doc_from_structure(query, profile)
+            if inferred_doc_name:
+                profile["target_doc_name"] = inferred_doc_name
+                profile["target_doc_is_explicit"] = False
+                profile.setdefault("precision_hints", {})["target_doc_name"] = inferred_doc_name
+        profile["retrieval_policy"] = _build_retrieval_policy(profile)
+        return profile, contract
+
+    def _infer_target_doc_from_code(self, profile: dict) -> str:
+        part_variants = _ccar_code_article_variants(profile)
+        if not part_variants:
+            return ""
+        scores: Dict[str, float] = defaultdict(float)
+        for record in load_all_structural_records():
+            if record.get("is_toc") or str(record.get("record_type") or "") == "doc":
+                continue
+            doc_name = str(record.get("doc_name") or "")
+            if not doc_name:
+                continue
+            article_id = str(record.get("article_id") or "")
+            if any(article_id == part or article_id.startswith(f"{part}.") for part in part_variants):
+                scores[doc_name] += 3.0
+            elif any(part and part in _compact_match_text(str(record.get("body_text") or "")[:700]) for part in part_variants):
+                scores[doc_name] += 0.45
+        if not scores:
+            return ""
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        if len(ranked) == 1 or ranked[0][1] >= ranked[1][1] * 1.35:
+            return ranked[0][0]
+        return ""
 
     def _build_anchor_candidates(self, metadata: dict, content: str) -> List[str]:
         candidates: List[str] = []
@@ -3843,310 +4655,264 @@ class HybridSearch:
                 hits.append({"chunk_id": hit.id, "content": hit.entity.get("content", ""), "score": float(hit.score), "channel": "vector"})
         return hits
 
+    def _record_es_channel_stats(
+        self,
+        channel: str,
+        *,
+        elapsed_seconds: float,
+        hit_count: int = 0,
+        error: str = "",
+    ) -> None:
+        with self._es_stats_lock:
+            stats = self._es_channel_stats[channel]
+            stats["calls"] += 1
+            stats["hits"] += int(hit_count)
+            stats["total_elapsed_seconds"] = round(float(stats["total_elapsed_seconds"]) + elapsed_seconds, 6)
+            stats["max_elapsed_seconds"] = round(max(float(stats["max_elapsed_seconds"]), elapsed_seconds), 6)
+            stats["last_elapsed_seconds"] = round(elapsed_seconds, 6)
+            if error:
+                stats["failures"] += 1
+                stats["last_error"] = error[:500]
+
+    def es_telemetry_snapshot(self) -> Dict[str, dict]:
+        with self._es_stats_lock:
+            return {channel: dict(stats) for channel, stats in self._es_channel_stats.items()}
+
+    def _execute_es_channel_search(self, channel: str, query: str, body: dict) -> List[dict]:
+        started = time.time()
+        try:
+            response = self.es_client.options(
+                request_timeout=ES_REQUEST_TIMEOUT_SECONDS,
+                retry_on_timeout=False,
+            ).search(
+                index=ES_INDEX,
+                body=body,
+                timeout=f"{math.ceil(ES_QUERY_TIMEOUT_SECONDS)}s",
+                track_total_hits=False,
+            )
+            hits = response["hits"]["hits"]
+            elapsed = time.time() - started
+            self._record_es_channel_stats(channel, elapsed_seconds=elapsed, hit_count=len(hits))
+            if elapsed >= ES_SLOW_QUERY_SECONDS:
+                logger.warning("ES channel slow channel=%s elapsed=%.3fs hits=%d", channel, elapsed, len(hits))
+            return [es_hit_to_channel_result(hit, channel) for hit in hits]
+        except Exception as exc:
+            elapsed = time.time() - started
+            self._record_es_channel_stats(channel, elapsed_seconds=elapsed, error=f"{type(exc).__name__}: {exc}")
+            logger.warning("ES channel failed channel=%s query=%s elapsed=%.3fs error=%s", channel, query, elapsed, exc)
+            return []
+
     def _article_search(self, query: str, profile: dict, top_k: int = ARTICLE_RECALL) -> List[dict]:
         query_signature = profile.get("query_signature", {})
-        should = []
-        article_id = query_signature.get("article_id", "")
-        article_label = query_signature.get("article_label", "")
-        article_id_variants = query_signature.get("article_id_variants", [])
-        article_label_variants = query_signature.get("article_label_variants", [])
-        normalized_heading = query_signature.get("normalized_heading", "")
-        target_roles = query_signature.get("target_roles", [])
         precision_hints = profile.get("precision_hints") or {}
-
-        if precision_hints.get("target_doc_name"):
-            should.append({"term": {"doc_name": {"value": precision_hints["target_doc_name"], "boost": 2.2}}})
-        for preferred_article in precision_hints.get("preferred_articles", []):
-            should.append({"term": {"article_id": {"value": preferred_article, "boost": 12.0}}})
-            should.append({"match_phrase": {"article_label": {"query": f"第{preferred_article}条", "boost": 9.5}}})
-        for related_article in precision_hints.get("related_articles", []):
-            should.append({"term": {"article_id": {"value": related_article, "boost": 3.2}}})
-        for preferred_section in precision_hints.get("preferred_sections", []):
-            should.append({"term": {"section_id": {"value": preferred_section, "boost": 8.0}}})
-            should.append({"match_phrase": {"section_title": {"query": preferred_section, "boost": 3.5}}})
-        for required_term in precision_hints.get("required_terms", []):
-            should.append({"match_phrase": {"retrieval_text": {"query": required_term, "boost": 3.4}}})
-            should.append({"match_phrase": {"content": {"query": required_term, "boost": 2.8}}})
-
-        for article_id_variant in article_id_variants or ([article_id] if article_id else []):
-            should.append({"term": {"article_id": {"value": article_id_variant, "boost": 8.0}}})
-        for article_label_variant in article_label_variants or ([article_label] if article_label else []):
-            should.append({"term": {"article_label": {"value": article_label_variant, "boost": 8.8}}})
-            should.append({"match_phrase": {"section_title": {"query": article_label_variant, "boost": 6.2}}})
-            should.append({"match_phrase": {"heading_text": {"query": article_label_variant, "boost": 6.8}}})
-            should.append({"match_phrase": {"scope_anchor": {"query": article_label_variant, "boost": 7.2}}})
-            should.append({"match_phrase": {"heading_path_text": {"query": article_label_variant, "boost": 6.4}}})
-
-        if normalized_heading:
-            should.append({"term": {"normalized_heading": {"value": normalized_heading, "boost": 7.2}}})
-
-        for alias in _build_query_aliases(query):
-            should.extend(
-                [
-                    {"match_phrase": {"scope_anchor": {"query": alias, "boost": 5.4}}},
-                    {"match_phrase": {"heading_path_text": {"query": alias, "boost": 5.0}}},
-                    {"match_phrase": {"section_title": {"query": alias, "boost": 4.5}}},
-                    {"match_phrase": {"heading_text": {"query": alias, "boost": 4.9}}},
-                    {"match_phrase": {"clause_path": {"query": alias, "boost": 3.8}}},
-                ]
-            )
-
-        for role in target_roles:
-            if role and role != "text":
-                should.append({"term": {"chunk_role": {"value": role, "boost": 1.8}}})
+        should = []
+        should.extend(build_precision_hint_clauses(precision_hints, ARTICLE_PRECISION_PROFILE))
+        contract = profile.get("retrieval_contract") or {}
+        if _contract_needs_code_lexical_recall(profile):
+            should.extend(build_code_variant_clauses(contract.get("query_codes", []) or [], code_query_variants, CODE_LEXICAL_PROFILE))
+        should.extend(build_article_reference_clauses(query_signature, query_signature.get("target_roles", []), ARTICLE_REFERENCE_PROFILE))
+        should.extend(build_alias_clauses(_contract_recall_aliases(query, profile), ARTICLE_ALIAS_PROFILE))
 
         if not should:
             return []
 
-        body = {"query": {"bool": {"should": should, "minimum_should_match": 1}}, "size": top_k}
-        try:
-            response = self.es_client.search(index=ES_INDEX, body=body)
-            return [
-                {
-                    "chunk_id": hit["_source"]["chunk_id"],
-                    "content": hit["_source"].get("content", ""),
-                    "score": float(hit.get("_score", 0.0)),
-                    "channel": "article",
-                }
-                for hit in response["hits"]["hits"]
-            ]
-        except Exception:
-            return []
+        body = EsQueryPlan(should=should).body(top_k)
+        return self._execute_es_channel_search("article", query, body)
 
     def _keyword_search(self, query: str, profile: dict, top_k: int = KW_RECALL) -> List[dict]:
-        aliases = _build_query_aliases(query)
-        should = []
-        for index, alias in enumerate(aliases):
-            decay = max(0.58, 1.0 - 0.14 * index)
-            should.extend(
-                [
-                    {
-                        "multi_match": {
-                            "query": alias,
-                            "fields": [
-                                "content^1.2",
-                                "retrieval_text^1.4",
-                                "scope_anchor^3.8",
-                                "heading_path_text^2.8",
-                                "heading_text^2.6",
-                                "section_title^2.2",
-                                "parent_heading^1.3",
-                                "highlight_text^1.4",
-                                "doc_name^0.6",
-                                "article_label^3.0",
-                                "clause_path^2.0",
-                            ],
-                            "type": "best_fields",
-                            "boost": 1.0 * decay,
-                        }
-                    },
-                    {"match_phrase": {"content": {"query": alias, "boost": 3.5 * decay}}},
-                    {"match_phrase": {"scope_anchor": {"query": alias, "boost": 5.0 * decay}}},
-                    {"match_phrase": {"heading_path_text": {"query": alias, "boost": 4.8 * decay}}},
-                    {"match_phrase": {"heading_text": {"query": alias, "boost": 4.2 * decay}}},
-                    {"match_phrase": {"clause_path": {"query": alias, "boost": 4.4 * decay}}},
-                ]
-            )
-            if profile.get("exact_match_bias"):
-                should.append({"match_phrase": {"section_title": {"query": alias, "boost": 4.8 * decay}}})
+        aliases = _contract_recall_aliases(query, profile)
+        focus_terms = _contract_focus_terms(profile)
+        for term in focus_terms:
+            if term and term not in aliases:
+                aliases.append(term)
+        should = build_alias_clauses(
+            aliases,
+            KEYWORD_ALIAS_PROFILE,
+            exact_match_bias=bool(profile.get("exact_match_bias")),
+        )
 
-        body = {"query": {"bool": {"should": should, "minimum_should_match": 1}}, "size": top_k}
-        try:
-            response = self.es_client.search(index=ES_INDEX, body=body)
-            return [
-                {
-                    "chunk_id": hit["_source"]["chunk_id"],
-                    "content": hit["_source"].get("content", ""),
-                    "score": float(hit.get("_score", 0.0)),
-                    "channel": "keyword",
-                }
-                for hit in response["hits"]["hits"]
-            ]
-        except Exception:
-            return []
+        body = EsQueryPlan(should=should).body(top_k)
+        return self._execute_es_channel_search("keyword", query, body)
 
     def _heading_search(self, query: str, profile: dict, top_k: int = HEADING_RECALL) -> List[dict]:
-        aliases = _build_query_aliases(query)
-        should = []
-        for index, alias in enumerate(aliases):
-            decay = max(0.58, 1.0 - 0.14 * index)
-            should.extend(
-                [
-                    {"match_phrase": {"scope_anchor": {"query": alias, "boost": 6.4 * decay}}},
-                    {"match_phrase": {"heading_path_text": {"query": alias, "boost": 5.6 * decay}}},
-                    {"match_phrase": {"heading_text": {"query": alias, "boost": 6.0 * decay}}},
-                    {"match_phrase": {"section_title": {"query": alias, "boost": 5.0 * decay}}},
-                    {"match_phrase": {"clause_path": {"query": alias, "boost": 4.6 * decay}}},
-                    {"match": {"heading_text": {"query": alias, "boost": 2.5 * decay}}},
-                ]
-            )
-
-        body = {
-            "query": {
-                "bool": {
-                    "should": should,
-                    "minimum_should_match": 1,
-                }
-            },
-            "size": top_k,
-        }
-        try:
-            response = self.es_client.search(index=ES_INDEX, body=body)
-            return [
-                {
-                    "chunk_id": hit["_source"]["chunk_id"],
-                    "content": hit["_source"].get("content", ""),
-                    "score": float(hit.get("_score", 0.0)),
-                    "channel": "heading",
-                }
-                for hit in response["hits"]["hits"]
-            ]
-        except Exception:
-            return []
+        aliases = _contract_recall_aliases(query, profile)
+        should = build_alias_clauses(aliases, HEADING_ALIAS_PROFILE)
+        body = EsQueryPlan(should=should).body(top_k)
+        return self._execute_es_channel_search("heading", query, body)
 
     def _structure_search(self, query: str, profile: dict, top_k: int = HEADING_RECALL) -> List[dict]:
-        aliases = _build_query_aliases(query)
+        aliases = _contract_recall_aliases(query, profile)
         query_signature = profile.get("query_signature", {})
         precision_hints = profile.get("precision_hints") or {}
         should = []
-
-        target_doc_name = profile.get("target_doc_name", "")
-        if target_doc_name:
-            should.append({"term": {"doc_name": {"value": target_doc_name, "boost": 2.8}}})
-        for preferred_article in precision_hints.get("preferred_articles", []):
-            should.append({"term": {"article_id": {"value": preferred_article, "boost": 13.0}}})
-            should.append({"match_phrase": {"article_label": {"query": f"第{preferred_article}条", "boost": 10.0}}})
-            should.append({"match_phrase": {"scope_anchor": {"query": f"第{preferred_article}条", "boost": 8.5}}})
-        for related_article in precision_hints.get("related_articles", []):
-            should.append({"term": {"article_id": {"value": related_article, "boost": 3.4}}})
-        for preferred_section in precision_hints.get("preferred_sections", []):
-            should.append({"term": {"section_id": {"value": preferred_section, "boost": 8.8}}})
-            should.append({"match_phrase": {"section_title": {"query": preferred_section, "boost": 4.0}}})
-        for required_term in precision_hints.get("required_terms", []):
-            should.append({"match_phrase": {"scope_anchor": {"query": required_term, "boost": 5.8}}})
-            should.append({"match_phrase": {"heading_path_text": {"query": required_term, "boost": 4.8}}})
-            should.append({"match_phrase": {"retrieval_text": {"query": required_term, "boost": 3.8}}})
-
-        article_id = query_signature.get("article_id", "")
-        article_label = query_signature.get("article_label", "")
-        for article_id_variant in query_signature.get("article_id_variants", []) or ([article_id] if article_id else []):
-            should.append({"term": {"article_id": {"value": article_id_variant, "boost": 8.5}}})
-        for article_label_variant in query_signature.get("article_label_variants", []) or ([article_label] if article_label else []):
-            should.extend(
-                [
-                    {"term": {"article_label": {"value": article_label_variant, "boost": 9.0}}},
-                    {"match_phrase": {"scope_anchor": {"query": article_label_variant, "boost": 7.8}}},
-                    {"match_phrase": {"heading_path_text": {"query": article_label_variant, "boost": 6.8}}},
-                    {"match_phrase": {"section_title": {"query": article_label_variant, "boost": 6.4}}},
-                ]
-            )
-
-        normalized_heading = query_signature.get("normalized_heading", "")
-        if normalized_heading:
-            should.append({"term": {"normalized_heading": {"value": normalized_heading, "boost": 8.2}}})
-
-        for role in profile.get("target_roles", []):
-            if role and role != "text":
-                should.append({"term": {"chunk_role": {"value": role, "boost": 2.3}}})
-
-        for index, alias in enumerate(aliases):
-            decay = max(0.58, 1.0 - 0.12 * index)
-            should.extend(
-                [
-                    {"match_phrase": {"scope_anchor": {"query": alias, "boost": 7.0 * decay}}},
-                    {"match_phrase": {"heading_path_text": {"query": alias, "boost": 6.2 * decay}}},
-                    {"match_phrase": {"section_title": {"query": alias, "boost": 5.8 * decay}}},
-                    {"match_phrase": {"heading_text": {"query": alias, "boost": 5.6 * decay}}},
-                    {"match_phrase": {"clause_path": {"query": alias, "boost": 4.6 * decay}}},
-                    {
-                        "multi_match": {
-                            "query": alias,
-                            "fields": [
-                                "scope_anchor^4.4",
-                                "heading_path_text^3.8",
-                                "section_title^3.5",
-                                "heading_text^3.5",
-                                "article_label^4.0",
-                                "clause_path^2.8",
-                                "highlight_text^1.4",
-                                "content^0.9",
-                            ],
-                            "type": "best_fields",
-                            "boost": 1.0 * decay,
-                        }
-                    },
-                ]
-            )
+        should.extend(build_precision_hint_clauses(precision_hints, STRUCTURE_PRECISION_PROFILE))
+        should.extend(build_article_reference_clauses(query_signature, profile.get("target_roles", []), STRUCTURE_REFERENCE_PROFILE))
+        should.extend(build_alias_clauses(aliases, STRUCTURE_ALIAS_PROFILE))
 
         if not should:
             return []
 
-        body = {
-            "query": {
-                "bool": {
-                    "should": should,
-                    "minimum_should_match": 1,
-                }
-            },
-            "size": top_k,
-        }
-        try:
-            response = self.es_client.search(index=ES_INDEX, body=body)
-            return [
-                {
-                    "chunk_id": hit["_source"]["chunk_id"],
-                    "content": hit["_source"].get("content", ""),
-                    "score": float(hit.get("_score", 0.0)),
-                    "channel": "structure",
-                }
-                for hit in response["hits"]["hits"]
-            ]
-        except Exception:
+        body = EsQueryPlan(should=should).body(top_k)
+        return self._execute_es_channel_search("structure", query, body)
+
+    def _table_search(self, query: str, profile: Optional[dict] = None, top_k: int = TABLE_RECALL) -> List[dict]:
+        profile = profile or {}
+        precision_hints = profile.get("precision_hints") or {}
+        aliases = _contract_recall_aliases(query, profile) if profile else [query]
+        should = []
+        should.extend(build_precision_hint_clauses(precision_hints, TABLE_PRECISION_PROFILE))
+        should.extend(build_alias_clauses(aliases, TABLE_ALIAS_PROFILE))
+        filters = [{"term": {"source_type": "table"}}]
+        target_filter = terms_filter("doc_name", _contract_target_doc_names(profile)) if profile else None
+        if target_filter:
+            filters.append(target_filter)
+        body = EsQueryPlan(should=should, filters=filters).body(top_k)
+        return self._execute_es_channel_search("table", query, body)
+
+    def _target_document_search(self, query: str, profile: dict, top_k: int = HEADING_RECALL) -> List[dict]:
+        target_doc_name = _contract_target_doc_name(profile)
+        if not target_doc_name:
             return []
 
-    def _table_search(self, query: str, top_k: int = TABLE_RECALL) -> List[dict]:
-        body = {
-            "query": {
-                "bool": {
-                    "filter": [{"term": {"source_type": "table"}}],
-                    "should": [
-                        {"match_phrase": {"section_title": {"query": query, "boost": 4.0}}},
-                        {"match": {"content": {"query": query, "boost": 1.6}}},
-                    ],
-                    "minimum_should_match": 1,
-                }
-            },
-            "size": top_k,
-        }
-        try:
-            response = self.es_client.search(index=ES_INDEX, body=body)
-            return [
-                {
-                    "chunk_id": hit["_source"]["chunk_id"],
-                    "content": hit["_source"].get("content", ""),
-                    "score": float(hit.get("_score", 0.0)),
-                    "channel": "table",
-                }
-                for hit in response["hits"]["hits"]
-            ]
-        except Exception:
+        aliases = _contract_recall_aliases(query, profile)
+        focus_terms = _contract_focus_terms(profile)
+
+        should = build_alias_clauses(aliases, TARGET_DOC_ALIAS_PROFILE)
+        for focus_term in focus_terms:
+            should.extend(
+                [
+                    match_phrase_clause("doc_name", focus_term, 6.5),
+                    match_phrase_clause("heading_path_text", focus_term, 5.2),
+                    match_phrase_clause("section_title", focus_term, 4.6),
+                    match_phrase_clause("content", focus_term, 3.2),
+                ]
+            )
+
+        body = EsQueryPlan(
+            should=should,
+            filters=[{"terms": {"doc_name": _contract_target_doc_names(profile)}}],
+            minimum_should_match=1,
+        ).body(top_k)
+        return self._execute_es_channel_search("target_document", query, body)
+
+    def _target_document_fallback_search(self, query: str, profile: dict, target_doc_name: str, top_k: int = 2) -> List[dict]:
+        if not target_doc_name:
             return []
+
+        aliases = _contract_recall_aliases(query, profile)
+        focus_terms = _contract_focus_terms(profile)
+        doc_aliases = _doc_alias_keys(target_doc_name)
+        should = build_alias_clauses(aliases + focus_terms + doc_aliases, TARGET_DOC_ALIAS_PROFILE)
+        for doc_alias in doc_aliases:
+            should.extend(
+                [
+                    match_phrase_clause("doc_name", doc_alias, 8.0),
+                    match_phrase_clause("section_title", doc_alias, 4.0),
+                    match_phrase_clause("heading_path_text", doc_alias, 4.0),
+                ]
+            )
+
+        body = EsQueryPlan(
+            should=should,
+            filters=[{"terms": {"doc_name": [target_doc_name]}}],
+            minimum_should_match=1,
+        ).body(top_k)
+        return self._execute_es_channel_search("target_document_fallback", query, body)
+
+    def _ensure_multi_target_source_coverage(
+        self,
+        query: str,
+        profile: dict,
+        contract: RetrievalContract,
+        sources: List[dict],
+        fallback_pools: Iterable[dict],
+    ) -> List[dict]:
+        if not (contract.allow_multi_doc or _contract_needs_multi_target_recall(contract)):
+            return sources
+        if not contract.synced_target_doc_names:
+            return sources
+
+        output = list(sources)
+        represented_docs = {str(row.get("doc_name") or "") for row in output}
+        additions: List[dict] = []
+        pool = list(fallback_pools)
+        for target_doc_name in contract.synced_target_doc_names:
+            if target_doc_name in represented_docs:
+                continue
+            pool_candidates = [row for row in pool if row.get("doc_name") == target_doc_name]
+            passed_pool_candidates = apply_contract(contract, pool_candidates, preserve_order=True)
+            target_row = passed_pool_candidates[0] if passed_pool_candidates else None
+            if target_row is None:
+                fallback_hits = self._target_document_fallback_search(query, profile, target_doc_name, top_k=2)
+                fallback_hits = apply_contract(contract, fallback_hits, preserve_order=True)
+                target_row = fallback_hits[0] if fallback_hits else None
+            if target_row is None:
+                continue
+            additions.append(target_row)
+            represented_docs.add(target_doc_name)
+
+        if not additions:
+            return output
+
+        final: List[dict] = []
+        seen_keys = set()
+
+        def row_key(row: dict) -> Tuple[str, str, str]:
+            return (
+                str(row.get("doc_name") or ""),
+                str(row.get("chunk_id") or row.get("structural_node_id") or row.get("article_id") or ""),
+                str(row.get("section_title") or ""),
+            )
+
+        def append_unique(row: dict) -> None:
+            key = row_key(row)
+            if key in seen_keys:
+                return
+            seen_keys.add(key)
+            final.append(row)
+
+        if output:
+            append_unique(output[0])
+        for row in additions:
+            append_unique(row)
+        for row in output[1:]:
+            append_unique(row)
+            if len(final) >= QA_TOP_K:
+                break
+        return final[:QA_TOP_K]
 
     def _rrf_fusion(self, recall_groups: List[Tuple[str, List[dict], float]], profile: dict) -> List[dict]:
+        policy = profile.get("retrieval_policy") or _build_retrieval_policy(profile)
         scores: Dict[str, float] = {}
         content_map: Dict[str, str] = {}
         channels: Dict[str, set] = defaultdict(set)
-        k = int(profile.get("rrf_k", 60))
+        channel_scores: Dict[str, Dict[str, float]] = defaultdict(dict)
+        k = max(int(policy.fusion.rrf_k), 1)
 
         for name, hits, weight in recall_groups:
+            raw_scores = [float(hit.get("score") or hit.get("rrf_score") or 0.0) for hit in hits]
+            min_score = min(raw_scores, default=0.0)
+            max_score = max(raw_scores, default=0.0)
+            span = max(max_score - min_score, 1e-9)
             for rank, hit in enumerate(hits):
                 chunk_id = hit["chunk_id"]
-                scores[chunk_id] = scores.get(chunk_id, 0.0) + float(weight) / (k + rank + 1)
+                raw_score = float(hit.get("score") or hit.get("rrf_score") or 0.0)
+                normalized_score = (raw_score - min_score) / span if max_score > min_score else (1.0 if raw_score > 0 else 0.0)
+                rank_score = float(weight) / (k + rank + 1)
+                score_score = float(weight) * policy.fusion.score_weight * normalized_score / k
+                scores[chunk_id] = scores.get(chunk_id, 0.0) + rank_score + score_score
                 channels[chunk_id].add(name)
+                channel_scores[chunk_id][name] = max(channel_scores[chunk_id].get(name, 0.0), round(normalized_score, 6))
                 content_map.setdefault(chunk_id, hit.get("content", ""))
 
         fused = [
-            {"chunk_id": chunk_id, "rrf_score": score, "content": content_map.get(chunk_id, ""), "channels": sorted(channels[chunk_id])}
+            {
+                "chunk_id": chunk_id,
+                "rrf_score": score + max(len(channels[chunk_id]) - 1, 0) * policy.fusion.channel_bonus,
+                "content": content_map.get(chunk_id, ""),
+                "channels": sorted(channels[chunk_id]),
+                "channel_scores": channel_scores.get(chunk_id, {}),
+            }
             for chunk_id, score in scores.items()
         ]
         return sorted(fused, key=lambda item: item["rrf_score"], reverse=True)
@@ -4154,11 +4920,12 @@ class HybridSearch:
     def _get_metadata(self, chunk_id: str) -> dict:
         if not chunk_id:
             return {}
-        if chunk_id in self._metadata_cache:
-            return self._metadata_cache[chunk_id]
+        cached = _lru_cache_get(self._metadata_cache, chunk_id)
+        if cached is not None:
+            return cached
         metadata = _es_get_by_id(self.es_client, chunk_id)
         if metadata:
-            self._metadata_cache[chunk_id] = metadata
+            _lru_cache_put(self._metadata_cache, chunk_id, metadata, METADATA_CACHE_MAX_ITEMS)
         return metadata
 
     def _get_metadata_batch(self, chunk_ids: List[str]) -> Dict[str, dict]:
@@ -4328,12 +5095,18 @@ class HybridSearch:
         page_count = int(record.get("page_count", page_end) or page_end)
         content = clean_block_text(record.get("body_text", ""))[:4200]
         highlight_text = _structural_highlight_text(record, heading, content)
+        raw_score = round(float(score), 6)
+        display_score = round(normalize_structural_score(raw_score), 6)
         return {
             "content": content,
             "doc_name": record.get("doc_name", ""),
             "heading": heading or clean_block_text(record.get("section_title", "")),
             "parent_heading": clean_block_text(record.get("section_title", "")),
-            "score": round(float(score), 6),
+            "score": display_score,
+            "display_score": display_score,
+            "ranking_score": raw_score,
+            "raw_structural_score": raw_score,
+            "score_components": {"structural": raw_score, "display": display_score},
             "chunk_id": record.get("record_id", ""),
             "page_number": page_number,
             "page_count": max(page_count, page_end),
@@ -4378,6 +5151,8 @@ class HybridSearch:
     def _search_structural_records(self, query: str, profile: dict, top_k: int = 12) -> List[dict]:
         target_doc_name = profile.get("target_doc_name", "")
         target_doc_is_explicit = bool(profile.get("target_doc_is_explicit"))
+        target_doc_names = set(_contract_target_doc_names(profile))
+        ccar_part_variants = _ccar_code_article_variants(profile)
         query_signature = profile.get("query_signature", {})
         records = load_all_structural_records()
         if not records:
@@ -4389,7 +5164,7 @@ class HybridSearch:
             semantic_role = str(record.get("semantic_role", ""))
             if record.get("is_toc") or record_type == "doc":
                 continue
-            if target_doc_name and target_doc_is_explicit and record.get("doc_name") != target_doc_name:
+            if target_doc_names and target_doc_is_explicit and record.get("doc_name") not in target_doc_names:
                 continue
             joined_text = clean_block_text(
                 "\n".join(
@@ -4403,6 +5178,19 @@ class HybridSearch:
                 )
             )
             score = _token_overlap_score(query, joined_text) + 0.9 * _ngram_similarity(query, joined_text)
+            low_evidence_penalty = _front_matter_penalty(
+                {
+                    "source_type": f"structural_{record_type or 'record'}",
+                    "section_title": " > ".join(record.get("heading_path", []) or []),
+                    "title": record.get("title", ""),
+                    "label": record.get("label", ""),
+                    "structural_path": " > ".join(record.get("heading_path", []) or []),
+                    "page_number": record.get("page_start", 1),
+                    "page_count": record.get("page_count", record.get("page_end", 0)),
+                },
+                joined_text,
+                profile,
+            )
             precision_hints = profile.get("precision_hints") or {}
             route = str(precision_hints.get("route") or "")
             subject_terms = [_compact_match_text(term) for term in precision_hints.get("subject_terms", []) if term]
@@ -4462,6 +5250,10 @@ class HybridSearch:
                     acronym_terms = [term for term in re.findall(r"[a-zA-Z]{2,}\d*(?:\.\d+)?", compact_query) if len(term) >= 3]
                     if acronym_terms and any(term in compact_joined_head for term in acronym_terms) and any(token in joined_text for token in ("小时", "日内", "工作日", "时限")):
                         score += 3.2
+                    if any(token in joined_text for token in ("小时", "分钟", "日内", "工作日", "个工作日", "时限")):
+                        score += 1.3
+                    if any(token in joined_text for token in ("法律责任", "罚款", "责令限期改正", "逾期不改正")):
+                        score -= 1.8
             compact_query = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9.]+", "", query)
             compact_joined = re.sub(r"[^\u4e00-\u9fffA-Za-z0-9.]+", "", joined_text)
             exact_anchor_hits = 0
@@ -4502,8 +5294,27 @@ class HybridSearch:
                         score += 0.7
                 if "规定" in compact_query and "规定" in compact_joined:
                     score += 0.16
+            if record_type == "article":
+                score += 0.35
+            elif record_type == "item":
+                score -= 0.28
             if target_doc_name:
                 score += 0.8 if record.get("doc_name") == target_doc_name else -0.6
+            if target_doc_names and record.get("doc_name") in target_doc_names:
+                score += 1.1
+            elif target_doc_names:
+                score -= 0.55
+            if ccar_part_variants:
+                article_number = _row_article_number(record)
+                article_id = str(record.get("article_id") or "")
+                if article_id and any(article_id.startswith(f"{part}.") or article_id == part for part in ccar_part_variants):
+                    score += 3.2
+                elif article_number and any(article_number.startswith(f"{part}.") or article_number == part for part in ccar_part_variants):
+                    score += 3.2
+                elif any(part and part in compact_joined for part in ccar_part_variants):
+                    score += 1.0
+                elif "ccar" in _compact_match_text(query):
+                    score -= 0.25
             if profile.get("query_type") == "article_lookup":
                 if _article_reference_matches(record.get("article_id", ""), record.get("article_label", ""), query_signature):
                     score += 4.2
@@ -4529,6 +5340,10 @@ class HybridSearch:
                 score += 1.2
 
             score += _precision_hint_score(record, profile, joined_text, structural=True)
+            if low_evidence_penalty:
+                score -= 2.4 * low_evidence_penalty
+            if _looks_like_reference_material(record, joined_text):
+                score -= 1.2
 
             if score < 0.75:
                 continue
@@ -4652,6 +5467,33 @@ class HybridSearch:
                 score += 0.55
             else:
                 score -= 0.48
+        target_doc_names = set(_contract_target_doc_names(profile))
+        if target_doc_names:
+            if metadata.get("doc_name") in target_doc_names:
+                score += 0.75
+            else:
+                score -= 0.6
+        focus_terms = _contract_focus_terms(profile)
+        if focus_terms:
+            focus_haystack = _compact_match_text(
+                " ".join(
+                    str(metadata.get(key) or "")
+                    for key in ("doc_name", "section_title", "heading_text", "scope_anchor", "retrieval_text", "content")
+                )
+            )
+            focus_scores = [
+                max(_token_overlap_score(term, focus_haystack), _ngram_similarity(term, focus_haystack))
+                for term in focus_terms
+                if term
+            ]
+            focus_hits = sum(1 for value in focus_scores if value >= 0.2)
+            focus_coverage = sum(focus_scores) / max(len(focus_scores), 1)
+            if focus_hits:
+                score += min(0.85, 0.22 * focus_hits + 0.45 * focus_coverage)
+            elif target_doc_names and metadata.get("doc_name") not in target_doc_names:
+                score -= 0.35
+            elif focus_terms:
+                score -= 0.16
         if "structure" in channels:
             score += 0.18 if profile.get("structure_first") else 0.08
         if profile.get("structure_first"):
@@ -4717,28 +5559,80 @@ class HybridSearch:
             score -= 0.14
         if metadata.get("cross_page"):
             score -= 0.05
+        content = metadata.get("retrieval_text") or metadata.get("content", hit.get("content", ""))
+        if _looks_like_reference_material(metadata, content):
+            score -= 0.72
+        score -= _front_matter_penalty(metadata, content, profile)
         score += 0.1 * max(min(float(metadata.get("title_body_consistency", 0.0)) - 0.45, 0.55), -0.45)
         score += 0.12 * max(min(float(metadata.get("parse_confidence", 0.0)) - 0.5, 0.5), -0.5)
         return round(score, 6)
 
+    def _apply_target_document_candidate_policy(
+        self,
+        fused: List[dict],
+        profile: dict,
+        contract,
+        recall,
+        candidate_window: int,
+    ) -> Tuple[List[dict], int]:
+        """Filter *fused* to the explicit target document when applicable.
+
+        When the target document is explicit, metadata is loaded in a window
+        that may be *larger* than ``candidate_window`` so that target-doc hits
+        beyond the normal window are still discoverable.  The returned
+        ``candidate_window`` is adjusted upward when metadata was expanded so
+        that downstream scoring covers all metadata-loaded hits.
+
+        Returns ``(filtered_fused, adjusted_candidate_window)``.
+        """
+        if not profile.get("target_doc_name") or not profile.get("target_doc_is_explicit"):
+            return fused, candidate_window
+
+        # Scan a wider window for metadata if the target doc might be outside
+        # the normal candidate window.
+        expanded_window = min(
+            max(candidate_window, recall.candidate_max, recall.target_document * 3),
+            len(fused),
+        )
+        if expanded_window > candidate_window:
+            extra_ids = [hit["chunk_id"] for hit in fused[candidate_window:expanded_window]
+                         if "metadata" not in hit]
+            if extra_ids:
+                extra_map = self._get_metadata_batch(extra_ids)
+                for hit in fused[candidate_window:expanded_window]:
+                    if "metadata" not in hit:
+                        hit["metadata"] = extra_map.get(hit["chunk_id"], {})
+
+        scan_end = expanded_window
+        target_doc_hits = [
+            hit
+            for hit in fused[:scan_end]
+            if (hit.get("metadata") or {}).get("doc_name") == profile["target_doc_name"]
+        ]
+
+        if target_doc_hits:
+            # Ensure downstream scoring covers the expanded window if we grew it.
+            return target_doc_hits, max(candidate_window, min(len(target_doc_hits), expanded_window))
+
+        # Target doc not found even in expanded window.
+        if contract.hard_target:
+            return [], 0
+
+        # Non-hard explicit target: keep original fused unchanged.
+        return fused, candidate_window
+
     def _search_candidates(self, query: str) -> Tuple[List[dict], dict]:
-        profile = analyze_query_intent(query)
-        target_doc_name = self._find_doc_name_by_query_reference(query)
-        if target_doc_name:
-            profile["target_doc_name"] = target_doc_name
-            profile["target_doc_is_explicit"] = True
-            profile.setdefault("precision_hints", {})["target_doc_name"] = target_doc_name
-        else:
-            inferred_doc_name = self._infer_target_doc_from_structure(query, profile)
-            if inferred_doc_name:
-                profile["target_doc_name"] = inferred_doc_name
-                profile["target_doc_is_explicit"] = False
-                profile.setdefault("precision_hints", {})["target_doc_name"] = inferred_doc_name
-        query_vec = self.embedder.encode([query], normalize_embeddings=True)[0].tolist()
+        profile, contract = self._build_retrieval_profile(query)
+        if contract.block_reason:
+            return [], profile
+        policy = profile.get("retrieval_policy") or _build_retrieval_policy(profile)
+        recall = policy.recall
+        retrieval_query = _strip_contract_identity_terms(query, profile)
+        query_vec = self.embedder.encode([retrieval_query], normalize_embeddings=True)[0].tolist()
 
         # Multi-Query: use query aliases for parallel vector search
-        aliases = _build_query_aliases(query)
-        unique_aliases = [a for a in aliases if a != query][:4]
+        aliases = _contract_query_aliases(query, profile)
+        unique_aliases = [a for a in aliases if a != retrieval_query][: recall.alias_limit]
         alias_vecs: List[List[float]] = []
         if unique_aliases and float(profile.get("vec_weight", 1.0)) >= 1.0:
             alias_vecs = self.embedder.encode(unique_aliases, normalize_embeddings=True).tolist()
@@ -4756,18 +5650,19 @@ class HybridSearch:
                 hyde_vec = self.embedder.encode([hyde_answer], normalize_embeddings=True)[0].tolist()
 
         def _run_vec_search(vec: List[float], label: str):
-            results = self._vector_search(vec, VEC_RECALL)
+            results = self._vector_search(vec, recall.vector)
             for hit in results:
                 hit["channels"] = list(hit.get("channels", [])) + [label]
             return results
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=7) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             vec_future = executor.submit(_run_vec_search, query_vec, "vector")
-            structure_future = executor.submit(self._structure_search, query, profile, HEADING_RECALL)
-            article_future = executor.submit(self._article_search, query, profile, ARTICLE_RECALL)
-            kw_future = executor.submit(self._keyword_search, query, profile, KW_RECALL)
-            heading_future = executor.submit(self._heading_search, query, profile, HEADING_RECALL)
-            table_future = executor.submit(self._table_search, query, TABLE_RECALL)
+            structure_future = executor.submit(self._structure_search, query, profile, recall.structure)
+            article_future = executor.submit(self._article_search, query, profile, recall.article)
+            kw_future = executor.submit(self._keyword_search, query, profile, recall.keyword)
+            heading_future = executor.submit(self._heading_search, query, profile, recall.heading)
+            table_future = executor.submit(self._table_search, query, profile, recall.table)
+            target_doc_future = executor.submit(self._target_document_search, query, profile, recall.target_document)
             alias_futures = {
                 label: executor.submit(_run_vec_search, vec, f"alias_{idx}")
                 for idx, (label, vec) in enumerate(zip(unique_aliases, alias_vecs))
@@ -4779,6 +5674,7 @@ class HybridSearch:
                 ("keyword", kw_future.result(), profile["kw_weight"]),
                 ("heading", heading_future.result(), profile["heading_weight"]),
                 ("table", table_future.result(), profile["table_weight"]),
+                ("target_document", target_doc_future.result(), max(profile["kw_weight"], profile["heading_weight"], 1.0) * 1.15),
             ]
             for label, future in alias_futures.items():
                 recall_groups.append((label, future.result(), profile["vec_weight"] * 0.5))
@@ -4796,29 +5692,25 @@ class HybridSearch:
         if not fused:
             return [], profile
 
-        candidate_ids = [hit["chunk_id"] for hit in fused[:60]]
+        candidate_window = max(recall.candidate_min, min(recall.candidate_max, len(fused)))
+        candidate_ids = [hit["chunk_id"] for hit in fused[:candidate_window]]
         metadata_map = self._get_metadata_batch(candidate_ids)
-        for hit in fused[:60]:
+        for hit in fused[:candidate_window]:
             hit["metadata"] = metadata_map.get(hit["chunk_id"], {})
-        if profile.get("target_doc_name") and profile.get("target_doc_is_explicit"):
-            target_doc_hits = [
-                hit
-                for hit in fused[:60]
-                if (hit.get("metadata") or {}).get("doc_name") == profile["target_doc_name"]
-            ]
-            if target_doc_hits:
-                fused = target_doc_hits
+        fused, candidate_window = self._apply_target_document_candidate_policy(
+            fused, profile, contract, recall, candidate_window,
+        )
 
         if self.reranker:
             pairs = [
                 (query, self._compose_rerank_text(hit.get("metadata", {}), hit.get("content", "")))
-                for hit in fused[:50]
+                for hit in fused[: recall.rerank_window]
             ]
             scores = self.reranker.predict(pairs, batch_size=16)
-            for index, hit in enumerate(fused[:50]):
+            for index, hit in enumerate(fused[: recall.rerank_window]):
                 hit["rerank_score"] = float(scores[index])
 
-        for hit in fused[:60]:
+        for hit in fused[:candidate_window]:
             hit["final_score"] = self._score_candidate(query, hit, hit.get("metadata", {}), profile)
 
         fused.sort(key=lambda item: item.get("final_score", item.get("rrf_score", 0.0)), reverse=True)
@@ -4861,7 +5753,7 @@ class HybridSearch:
                     {**metadata, "chunk_id": hit["chunk_id"]},
                     max(int(profile.get("expand_children", 4)) * 3, 6),
                     max(int(profile.get("child_char_budget", 900)), 2200 if profile["query_type"] == "article_lookup" else 900),
-                    include_headings=profile["query_type"] == "article_lookup",
+                    include_headings=profile["query_type"] in {"article_lookup", "procedure"},
                 )
                 if following:
                     content = "\n".join([content] + following)
@@ -4943,12 +5835,27 @@ class HybridSearch:
             metadata["section_title"] = highlight_label
 
         heading = metadata.get("section_title") or metadata.get("heading_text", "")
+        ranking_score = round(float(hit.get("final_score", hit.get("rrf_score", 0.0)) or 0.0), 6)
+        display_score = round(calibrate_ranking_score(ranking_score), 6)
+        score_components = {
+            "ranking": ranking_score,
+            "rrf": round(float(hit.get("rrf_score", 0.0) or 0.0), 6),
+            "display": display_score,
+        }
+        if "rerank_score" in hit:
+            score_components["rerank"] = round(float(hit.get("rerank_score", 0.0) or 0.0), 6)
         return {
             "content": content,
             "doc_name": metadata.get("doc_name", ""),
             "heading": heading,
             "parent_heading": metadata.get("parent_heading", ""),
-            "score": hit.get("final_score", hit.get("rrf_score", 0.0)),
+            "score": display_score,
+            "display_score": display_score,
+            "ranking_score": ranking_score,
+            "rrf_score": score_components["rrf"],
+            "rerank_score": score_components.get("rerank", 0.0),
+            "score_components": score_components,
+            "channel_scores": hit.get("channel_scores", {}),
             "chunk_id": hit["chunk_id"],
             "page_number": int(metadata.get("page_number", 1)),
             "page_count": int(metadata.get("page_count", 1)),
@@ -4972,40 +5879,40 @@ class HybridSearch:
             if not _is_valid_search_query(query):
                 return []
 
+            contract = build_retrieval_contract(query)
+            if contract.block_reason:
+                return []
+
             direct_evidence = self._document_applicability_evidence(query)
             if direct_evidence:
-                return [direct_evidence]
+                contracted_direct = _contracted_sources_or_none(contract, [direct_evidence])
+                if contracted_direct:
+                    return contracted_direct
 
-            structural_profile = analyze_query_intent(query)
-            target_doc_name = self._find_doc_name_by_query_reference(query)
-            if target_doc_name:
-                structural_profile["target_doc_name"] = target_doc_name
-                structural_profile["target_doc_is_explicit"] = True
-                structural_profile.setdefault("precision_hints", {})["target_doc_name"] = target_doc_name
-            else:
-                inferred_doc_name = self._infer_target_doc_from_structure(query, structural_profile)
-                if inferred_doc_name:
-                    structural_profile["target_doc_name"] = inferred_doc_name
-                    structural_profile["target_doc_is_explicit"] = False
-                    structural_profile.setdefault("precision_hints", {})["target_doc_name"] = inferred_doc_name
+            structural_profile, contract = self._build_retrieval_profile(query, contract)
             structural_records = load_all_structural_records()
             precision_hints = structural_profile.get("precision_hints") or {}
             if not _has_structural_subject_support(precision_hints, structural_records):
-                return []
+                structural_supported = False
+            else:
+                structural_supported = True
             structural_count_answer = answer_structural_count(query, structural_records)
-            if structural_count_answer and isinstance(structural_count_answer.get("sources"), list):
-                return structural_count_answer["sources"][:QA_TOP_K]
+            if structural_supported and structural_count_answer and isinstance(structural_count_answer.get("sources"), list):
+                contracted_structural = _contracted_sources_or_none(contract, structural_count_answer["sources"])
+                if contracted_structural:
+                    return contracted_structural
             structural_classification_answer = answer_structural_classification(query, structural_records)
-            if structural_classification_answer and isinstance(structural_classification_answer.get("sources"), list):
-                return structural_classification_answer["sources"][:QA_TOP_K]
+            if structural_supported and structural_classification_answer and isinstance(structural_classification_answer.get("sources"), list):
+                contracted_structural = _contracted_sources_or_none(contract, structural_classification_answer["sources"])
+                if contracted_structural:
+                    return contracted_structural
             structural_definition_answer = answer_structural_definition(query, structural_records)
-            if structural_definition_answer and isinstance(structural_definition_answer.get("sources"), list):
-                return structural_definition_answer["sources"][:QA_TOP_K]
-            if (structural_profile.get("precision_hints") or {}).get("route") == "definition":
-                return []
-
+            if structural_supported and structural_definition_answer and isinstance(structural_definition_answer.get("sources"), list):
+                contracted_structural = _contracted_sources_or_none(contract, structural_definition_answer["sources"])
+                if contracted_structural:
+                    return contracted_structural
             query_signature = structural_profile.get("query_signature", {})
-            if query_signature.get("article_id_variants") and structural_profile.get("target_doc_name"):
+            if structural_supported and query_signature.get("article_id_variants") and structural_profile.get("target_doc_name"):
                 exact_records = [
                     record
                     for record in structural_records
@@ -5018,7 +5925,7 @@ class HybridSearch:
 
             preferred_articles = {str(value) for value in precision_hints.get("preferred_articles", []) if value}
             exact_preferred_hits: List[dict] = []
-            if preferred_articles and precision_hints.get("target_doc_name"):
+            if structural_supported and preferred_articles and precision_hints.get("target_doc_name"):
                 exact_preferred_records = [
                     record
                     for record in structural_records
@@ -5030,7 +5937,7 @@ class HybridSearch:
                 exact_preferred_records.sort(key=lambda record: (int(record.get("page_start") or 1), int(record.get("order") or 0)))
                 exact_preferred_hits = [self._structural_record_to_evidence(record, 20.0) for record in exact_preferred_records[: len(preferred_articles)]]
 
-            structural_hits = self._search_structural_records(query, structural_profile, top_k=max(QA_TOP_K, 6))
+            structural_hits = self._search_structural_records(query, structural_profile, top_k=max(QA_TOP_K, 6)) if structural_supported else []
             if structural_hits:
                 structural_hits.sort(
                     key=lambda row: (
@@ -5096,18 +6003,11 @@ class HybridSearch:
                 except Exception as exc:
                     logger.warning("构建证据对象失败 chunk_id=%s: %s", hit.get("chunk_id"), exc)
                     continue
-                combined_text = clean_block_text(
-                    "\n".join(
-                        part
-                        for part in [
-                            evidence.get("section_title", ""),
-                            evidence.get("highlight_text", ""),
-                            evidence.get("content", ""),
-                        ]
-                        if part
-                    )
-                )
-                alignment = _query_alignment_score(query, evidence, profile)
+                alignment = _query_alignment_score(_strip_contract_identity_terms(query, profile), evidence, profile)
+                evidence_content = evidence.get("content", "")
+                evidence_quality = -_front_matter_penalty(evidence, evidence_content, profile)
+                if _looks_like_reference_material(evidence, evidence_content):
+                    evidence_quality -= 0.72
                 dedupe_key = (
                     evidence["doc_name"],
                     evidence["page_number"],
@@ -5128,7 +6028,8 @@ class HybridSearch:
                         article_heading_bonus += 0.18
                     if evidence.get("source_type") == "heading":
                         article_heading_bonus += 0.12
-                rank_score = evidence["score"] + 0.22 * alignment + (0.42 if is_exact_article else 0.0) + article_heading_bonus
+                evidence_rank_score = float(evidence.get("ranking_score", evidence.get("score", 0.0)) or 0.0)
+                rank_score = evidence_rank_score + 0.34 * alignment + 0.42 * evidence_quality + (0.42 if is_exact_article else 0.0) + article_heading_bonus
                 results.append((rank_score, evidence, is_exact_article))
             if profile.get("query_type") == "article_lookup" and article_variants:
                 exact_results = [item for item in results if item[2]]
@@ -5142,6 +6043,14 @@ class HybridSearch:
                         leading_doc_results = [item for item in exact_results if item[1].get("doc_name") == leading_doc_name]
                         results = leading_doc_results or exact_results
             results.sort(key=lambda item: item[0], reverse=True)
+            if profile.get("query_type") != "article_lookup":
+                body_results = [
+                    item
+                    for item in results
+                    if _front_matter_penalty(item[1], item[1].get("content", ""), profile) < 0.45
+                ]
+                if len(body_results) >= min(QA_TOP_K, 2):
+                    results = body_results
             merged: List[dict] = []
             structure_route = str((profile.get("precision_hints") or {}).get("route") or "")
             structure_priority_routes = {
@@ -5156,7 +6065,6 @@ class HybridSearch:
             }
             prefer_structural_hits = bool(
                 profile.get("structure_first")
-                or profile.get("query_type") in {"general", "concept_explanation"}
                 or structure_route in structure_priority_routes
             )
             if structural_hits and prefer_structural_hits:
@@ -5166,6 +6074,21 @@ class HybridSearch:
                     if len(merged) >= min(3 if structure_route in structure_priority_routes else 2, QA_TOP_K):
                         break
                     merged.append(row)
+
+            if (contract.allow_multi_doc or _contract_needs_multi_target_recall(contract)) and contract.synced_target_doc_names:
+                represented_docs = {row.get("doc_name", "") for row in merged}
+                for target_doc_name in contract.synced_target_doc_names:
+                    if target_doc_name in represented_docs:
+                        continue
+                    target_row = next((row for row in structural_hits if row.get("doc_name") == target_doc_name), None)
+                    if target_row is None:
+                        target_row = next((row for _, row, _ in results if row.get("doc_name") == target_doc_name), None)
+                    if target_row is None:
+                        continue
+                    merged.append(target_row)
+                    represented_docs.add(target_doc_name)
+                    if len(merged) >= QA_TOP_K:
+                        break
 
             def evidence_keys(row: dict) -> set:
                 doc_name = row.get("doc_name", "")
@@ -5205,7 +6128,10 @@ class HybridSearch:
                     seen.update(keys)
                     if len(merged) >= QA_TOP_K:
                         break
-            return merged[:QA_TOP_K]
+            contracted = apply_contract(contract, merged, keep_failed_when_no_hard_constraints=True)
+            fallback_pools = list(merged) + structural_hits + [row for _, row, _ in results]
+            contracted = self._ensure_multi_target_source_coverage(query, profile, contract, contracted, fallback_pools)
+            return contracted[:QA_TOP_K]
         except Exception as exc:
             logger.exception("检索问答链路执行失败 query=%s", query)
             raise RuntimeError(f"检索执行失败：{exc}") from exc
@@ -5245,15 +6171,15 @@ def main():
 
         if choice == "1":
             print("\n正在构建索引，请稍候...")
-            manager = DualDBManager()
-            print(manager.build_index().message)
+            with DualDBManager() as manager:
+                print(manager.build_index().message)
         elif choice == "2":
             query = input("\n请输入检索问题：").strip()
             if not query:
                 print("查询内容不能为空。")
                 continue
-            engine = HybridSearch(hyde_llm_call=None)
-            print(engine.search(query))
+            with HybridSearch(hyde_llm_call=None) as engine:
+                print(engine.search(query))
         elif choice == "3":
             print("再见。")
             break

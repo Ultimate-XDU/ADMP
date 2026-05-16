@@ -20,11 +20,11 @@ os.environ.setdefault("AEROSPACE_SKIP_UPLOAD_DIR_SYNC", "1")
 
 from aerospace_api import ClassifyRequest, classify_document
 from aerospace_search_main import DOC_DIR
+from management_state_store import load_state, update_state
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DOC_DIR_PATH = Path(DOC_DIR)
-STATE_FILE = BASE_DIR / "management_state.json"
 REPORT_FILE = BASE_DIR / "public_reference_import_report.json"
 
 SESSION = requests.Session()
@@ -163,16 +163,12 @@ def _format_file_size(size: int) -> str:
     return f"{size / (1024 * 1024):.1f} MB"
 
 
-def _load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+def _default_state() -> dict:
     return {"knowledgeBases": [], "documents": [], "kbIdCounter": 200, "docIdCounter": 4000}
 
 
-def _save_state(payload: dict) -> None:
-    temp = STATE_FILE.with_suffix(".tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(STATE_FILE)
+def _load_state() -> dict:
+    return load_state() or _default_state()
 
 
 def _extract_field(text: str, label: str) -> str:
@@ -340,29 +336,34 @@ def _docx_quality(path: Path) -> dict:
 
 
 def _upsert_document_state(file_path: Path, item: ImportItem, metadata: dict, status: str = "READY") -> None:
-    payload = _load_state()
-    documents = payload.setdefault("documents", [])
     storage_name = file_path.name
-    existing = next((doc for doc in documents if doc.get("storageFileName") == storage_name), None)
-    if existing is None:
-        payload["docIdCounter"] = int(payload.get("docIdCounter", 4000)) + 1
-        existing = {"id": payload["docIdCounter"]}
-        documents.insert(0, existing)
-    existing.update(
-        {
-            "fileName": file_path.stem,
-            "knowledgeBaseId": item.classified_kb_id,
-            "type": file_path.suffix.lstrip(".").upper(),
-            "size": _format_file_size(file_path.stat().st_size),
-            "chunkCount": int(existing.get("chunkCount") or 0),
-            "status": status,
-            "uploadedAt": time.strftime("%Y-%m-%d %H:%M", time.localtime(file_path.stat().st_mtime)),
-            "summary": f"公开资料导入：{KB_NAMES[item.classified_kb_id]}，来源={item.source_name}，分类依据={item.classification_reason}",
-            "storageFileName": storage_name,
-            "sourceUrl": item.page_url or item.url,
-        }
-    )
-    _save_state(payload)
+
+    def mutate(payload: dict) -> bool:
+        if not payload:
+            payload.update(_default_state())
+        documents = payload.setdefault("documents", [])
+        existing = next((doc for doc in documents if doc.get("storageFileName") == storage_name), None)
+        if existing is None:
+            payload["docIdCounter"] = int(payload.get("docIdCounter", 4000)) + 1
+            existing = {"id": payload["docIdCounter"]}
+            documents.insert(0, existing)
+        existing.update(
+            {
+                "fileName": file_path.stem,
+                "knowledgeBaseId": item.classified_kb_id,
+                "type": file_path.suffix.lstrip(".").upper(),
+                "size": _format_file_size(file_path.stat().st_size),
+                "chunkCount": int(existing.get("chunkCount") or 0),
+                "status": status,
+                "uploadedAt": time.strftime("%Y-%m-%d %H:%M", time.localtime(file_path.stat().st_mtime)),
+                "summary": f"公开资料导入：{KB_NAMES[item.classified_kb_id]}，来源={item.source_name}，分类依据={item.classification_reason}",
+                "storageFileName": storage_name,
+                "sourceUrl": item.page_url or item.url,
+            }
+        )
+        return True
+
+    update_state(mutate)
 
 
 def collect_candidates(max_pages: int) -> tuple[list[ImportItem], list[dict]]:

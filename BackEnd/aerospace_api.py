@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import fitz
+from elasticsearch import Elasticsearch
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -31,8 +32,10 @@ if _env_path.exists():
 # 确保能导入同目录模块
 sys.path.insert(0, str(Path(__file__).parent))
 
-from aerospace_search_main import HybridSearch, DualDBManager, IndexOperationResult
+from aerospace_search_main import ES_HOST, ES_INDEX, HybridSearch, DualDBManager, IndexOperationResult
 from aerospace_qa import ask_structured, call_qwen
+from aerospace_retrieval_contract import clear_contract_caches
+from management_state_store import StateStore
 
 # ==========================================
 # FastAPI 应用
@@ -69,6 +72,39 @@ def get_engine():
                 except Exception as exc:
                     raise HTTPException(status_code=503, detail=f"检索服务不可用，请先启动 Elasticsearch 和 Milvus：{exc}") from exc
     return _engine
+
+
+def _close_resource(resource: object) -> None:
+    close = getattr(resource, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            logger.debug("resource close failed", exc_info=True)
+
+
+def _reset_engine() -> None:
+    global _engine
+    with _engine_lock:
+        old_engine = _engine
+        _engine = None
+    if old_engine is not None:
+        _close_resource(old_engine)
+
+
+def _reset_db_manager() -> None:
+    global _db_manager
+    with _db_manager_lock:
+        old_manager = _db_manager
+        _db_manager = None
+    if old_manager is not None:
+        _close_resource(old_manager)
+
+
+@app.on_event("shutdown")
+def _shutdown_resources() -> None:
+    _reset_engine()
+    _reset_db_manager()
 
 
 def _ensure_index_action_success(result: IndexOperationResult, success_actions: tuple[str, ...]) -> IndexOperationResult:
@@ -306,6 +342,14 @@ class QASourceItem(BaseModel):
     heading: str
     parent_heading: str
     score: float
+    display_score: float = 0.0
+    ranking_score: float = 0.0
+    rrf_score: float = 0.0
+    rerank_score: float = 0.0
+    raw_structural_score: float = 0.0
+    evidence_quality: float = 0.0
+    score_components: dict[str, float] = Field(default_factory=dict)
+    channel_scores: dict[str, float] = Field(default_factory=dict)
     chunk_id: str = ""
     page_number: int = 1
     page_count: int = 1
@@ -583,9 +627,15 @@ def reload_modules():
     import aerospace_search_main
     import aerospace_qa
     import aerospace_structure
-    importlib.reload(aerospace_structure)
-    importlib.reload(aerospace_search_main)
-    importlib.reload(aerospace_qa)
+    _reset_engine()
+    _reset_db_manager()
+    try:
+        importlib.reload(aerospace_structure)
+        importlib.reload(aerospace_search_main)
+        importlib.reload(aerospace_qa)
+    except Exception as exc:
+        logger.exception("热重载模块失败")
+        raise HTTPException(status_code=500, detail=f"模块热重载失败：{exc}") from exc
     # Re-import into this module's namespace
     globals()["ask_structured"] = aerospace_qa.ask_structured
     globals()["HybridSearch"] = aerospace_search_main.HybridSearch
@@ -601,6 +651,7 @@ UPLOAD_DIR = Path(__file__).parent / "aerospace_docs"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 STATE_FILE = Path(__file__).parent / "management_state.json"
+_state_store = StateStore(STATE_FILE)
 HEALTH_REPORT_FILE = Path(__file__).parent / "document_health_reports.json"
 _DOCUMENT_TYPE_SUFFIX = {
     "PDF": ".pdf",
@@ -865,10 +916,9 @@ def _persist_management_state():
         "kbIdCounter": _kb_id_counter,
         "docIdCounter": _doc_id_counter,
     }
-    temp_path = STATE_FILE.with_suffix(".tmp")
     try:
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp_path.replace(STATE_FILE)
+        _state_store.save(payload)
+        clear_contract_caches()
     except Exception as exc:
         print(f"[WARN] 保存管理状态失败: {exc}")
 
@@ -890,6 +940,25 @@ def _load_document_health_report_map() -> dict[str, dict]:
     return {}
 
 
+def _load_live_es_document_counts() -> dict[str, int] | None:
+    es = None
+    try:
+        es = Elasticsearch(ES_HOST)
+        body = {"size": 0, "aggs": {"docs": {"terms": {"field": "doc_name", "size": 10000}}}}
+        response = es.search(index=ES_INDEX, body=body)
+        buckets = response.get("aggregations", {}).get("docs", {}).get("buckets", [])
+        return {str(bucket.get("key") or ""): _safe_int(bucket.get("doc_count"), 0) for bucket in buckets}
+    except Exception as exc:
+        logger.debug("读取 ES 实时文档计数失败，跳过索引状态回收: %s", exc)
+        return None
+    finally:
+        if es is not None:
+            try:
+                es.close()
+            except Exception:
+                logger.debug("Elasticsearch client close failed", exc_info=True)
+
+
 def _update_document_index_state(storage_file_name: str, chunk_count: int, status: str = "SYNCED") -> bool:
     updated = False
     for record in _documents:
@@ -902,27 +971,42 @@ def _update_document_index_state(storage_file_name: str, chunk_count: int, statu
         updated = True
         break
     if updated:
-        _persist_management_state()
+        _state_store.update_document(storage_file_name, status, chunk_count=chunk_count if chunk_count >= 0 else None)
+        clear_contract_caches()
     return updated
 
 
 def _sync_document_index_state_from_reports():
     reports = _load_document_health_report_map()
-    if not reports:
+    live_counts = _load_live_es_document_counts()
+    if not reports and live_counts is None:
         return
 
     changed = False
     for record in _documents:
         storage_file_name = _get_document_storage_file_name(record)
+        if live_counts is not None:
+            live_chunk_count = _safe_int(live_counts.get(storage_file_name), 0)
+            if live_chunk_count > 0:
+                if record.get("chunkCount") != live_chunk_count:
+                    record["chunkCount"] = live_chunk_count
+                    changed = True
+                if record.get("status") != "SYNCED":
+                    record["status"] = "SYNCED"
+                    changed = True
+                continue
+            if record.get("status") == "SYNCED":
+                record["status"] = "READY"
+                record["chunkCount"] = 0
+                changed = True
+            continue
+
         report = reports.get(storage_file_name)
         if not isinstance(report, dict):
             continue
         chunk_count = _safe_int(report.get("chunk_count"), record.get("chunkCount", 0))
-        if record.get("chunkCount") != chunk_count:
+        if record.get("status") == "SYNCED" and record.get("chunkCount") != chunk_count:
             record["chunkCount"] = chunk_count
-            changed = True
-        if record.get("status") in {"READY", "INDEXING", "CHUNKING"}:
-            record["status"] = "SYNCED"
             changed = True
     if changed:
         _persist_management_state()
@@ -1003,7 +1087,7 @@ def _load_management_state():
     state_exists = STATE_FILE.exists()
     if state_exists:
         try:
-            payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            payload = _state_store.load()
         except Exception as exc:
             print(f"[WARN] 读取管理状态失败，将回退到默认配置: {exc}")
         else:
@@ -1326,8 +1410,7 @@ def index_document(req: IndexRequest):
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"增量索引失败: {exc}") from exc
     # 索引成功后，需要重新初始化搜索引擎以加载新数据
-    global _engine
-    _engine = None
+    _reset_engine()
     # 从结果中提取块数（使用正则，避免文件名中含“共”导致误解析）
     chunk_count = result.chunk_count if result.chunk_count > 0 else _extract_chunk_count_from_message(result.message)
     _update_document_index_state(storage_file_name, chunk_count, status="SYNCED")
@@ -1352,8 +1435,7 @@ def rebuild_index():
         raise
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"重建索引失败: {exc}") from exc
-    global _engine
-    _engine = None
+    _reset_engine()
     _sync_document_index_state_from_reports()
     return {
         "message": result.message,
@@ -1377,8 +1459,7 @@ def remove_document_index(doc_name: str):
         raise
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"删除索引失败: {resolved_name}: {exc}") from exc
-    global _engine
-    _engine = None
+    _reset_engine()
     _update_document_index_state(resolved_name, 0, status="READY")
     return {
         "message": result.message,

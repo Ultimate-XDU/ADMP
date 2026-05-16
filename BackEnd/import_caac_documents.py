@@ -16,11 +16,11 @@ from docx import Document as DocxDocument
 import fitz
 
 from aerospace_search_main import DOC_DIR, DualDBManager
+from management_state_store import load_state, update_document_state, update_state
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DOC_DIR_PATH = Path(DOC_DIR)
-STATE_FILE = BASE_DIR / "management_state.json"
 IMPORT_REPORT = BASE_DIR / "caac_import_report.json"
 
 SESSION = requests.Session()
@@ -286,43 +286,44 @@ def _format_file_size(size: int) -> str:
     return f"{size / (1024 * 1024):.1f} MB"
 
 
-def _load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+def _default_state() -> dict:
     return {"knowledgeBases": [], "documents": [], "kbIdCounter": 200, "docIdCounter": 4000}
 
 
-def _save_state(payload: dict) -> None:
-    temp = STATE_FILE.with_suffix(".tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(STATE_FILE)
+def _load_state() -> dict:
+    return load_state() or _default_state()
 
 
 def upsert_document_state(file_path: Path, item: CaacItem, metadata: dict) -> None:
-    payload = _load_state()
-    documents = payload.setdefault("documents", [])
     storage_name = file_path.name
     display_name = file_path.stem
-    existing = next((doc for doc in documents if doc.get("storageFileName") == storage_name), None)
-    if existing is None:
-        payload["docIdCounter"] = int(payload.get("docIdCounter", 4000)) + 1
-        existing = {"id": payload["docIdCounter"]}
-        documents.insert(0, existing)
-    existing.update(
-        {
-            "fileName": display_name,
-            "knowledgeBaseId": item.kb_id,
-            "type": file_path.suffix.lstrip(".").upper(),
-            "size": _format_file_size(file_path.stat().st_size),
-            "chunkCount": int(existing.get("chunkCount") or 0),
-            "status": "READY",
-            "uploadedAt": time.strftime("%Y-%m-%d %H:%M", time.localtime(file_path.stat().st_mtime)),
-            "summary": f"CAAC导入：{metadata.get('category', item.category)} {metadata.get('date', '')}".strip(),
-            "storageFileName": storage_name,
-            "sourceUrl": item.url,
-        }
-    )
-    _save_state(payload)
+
+    def mutate(payload: dict) -> bool:
+        if not payload:
+            payload.update(_default_state())
+        documents = payload.setdefault("documents", [])
+        existing = next((doc for doc in documents if doc.get("storageFileName") == storage_name), None)
+        if existing is None:
+            payload["docIdCounter"] = int(payload.get("docIdCounter", 4000)) + 1
+            existing = {"id": payload["docIdCounter"]}
+            documents.insert(0, existing)
+        existing.update(
+            {
+                "fileName": display_name,
+                "knowledgeBaseId": item.kb_id,
+                "type": file_path.suffix.lstrip(".").upper(),
+                "size": _format_file_size(file_path.stat().st_size),
+                "chunkCount": int(existing.get("chunkCount") or 0),
+                "status": "READY",
+                "uploadedAt": time.strftime("%Y-%m-%d %H:%M", time.localtime(file_path.stat().st_mtime)),
+                "summary": f"CAAC导入：{metadata.get('category', item.category)} {metadata.get('date', '')}".strip(),
+                "storageFileName": storage_name,
+                "sourceUrl": item.url,
+            }
+        )
+        return True
+
+    update_state(mutate)
 
 
 def collect_candidates(limit: int, max_pages: int) -> list[CaacItem]:
@@ -368,12 +369,29 @@ def _materialize_item(item: CaacItem) -> dict:
     }
 
 
-def import_documents(limit: int, max_pages: int, index: bool, target_pdf: int = 0, target_docx: int = 0) -> list[dict]:
+def import_documents(
+    limit: int,
+    max_pages: int,
+    index: bool,
+    target_pdf: int = 0,
+    target_docx: int = 0,
+    _manager: DualDBManager | None = None,
+) -> list[dict]:
     DOC_DIR_PATH.mkdir(parents=True, exist_ok=True)
+    if index and _manager is None:
+        with DualDBManager() as manager:
+            return import_documents(
+                limit,
+                max_pages,
+                index,
+                target_pdf=target_pdf,
+                target_docx=target_docx,
+                _manager=manager,
+            )
     search_limit = max(limit * 4, target_pdf + target_docx + 40) if (target_pdf or target_docx) else limit
     candidates = collect_candidates(search_limit, max_pages)
     report: list[dict] = []
-    manager = DualDBManager() if index else None
+    manager = _manager if index else None
     pdf_count = 0
     docx_count = 0
 
@@ -408,14 +426,12 @@ def import_documents(limit: int, max_pages: int, index: bool, target_pdf: int = 
                 result = manager.add_document(str(file_path))
                 if result.success:
                     chunk_count = int(result.chunk_count or 0)
-                    payload = _load_state()
-                    for doc in payload.get("documents", []):
-                        if doc.get("storageFileName") == file_path.name:
-                            doc["status"] = "SYNCED"
-                            doc["chunkCount"] = chunk_count
-                            doc["summary"] = f"CAAC导入并索引成功：{time.strftime('%Y-%m-%d %H:%M:%S')}"
-                            break
-                    _save_state(payload)
+                    update_document_state(
+                        file_path.name,
+                        "SYNCED",
+                        chunk_count=chunk_count,
+                        summary=f"CAAC导入并索引成功：{time.strftime('%Y-%m-%d %H:%M:%S')}",
+                    )
                     print(f"  indexed chunks: {chunk_count}")
                 else:
                     print(f"  index failed: {result.message}")
