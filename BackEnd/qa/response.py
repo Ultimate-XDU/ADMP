@@ -16,6 +16,9 @@ from utils.retrieval_contract import RetrievalContract, apply_contract, build_re
 
 from search.hybrid_search import HybridSearch
 
+from ._shared import _compact_evidence_text
+from .evidence import _repair_response_sources
+
 def _is_noisy_highlight_line(value: str) -> bool:
     line = re.sub(r"\s+", " ", str(value or "")).strip()
     if len(line) < 4:

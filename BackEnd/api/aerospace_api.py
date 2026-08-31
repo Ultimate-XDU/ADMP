@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from aerospace_search_main import ES_HOST, ES_INDEX, HybridSearch, DualDBManager, IndexOperationResult
 from aerospace_qa import ask_structured, call_qwen
 from utils.retrieval_contract import clear_contract_caches
-from utils.state_store import StateStore
+from utils.state_store import DEFAULT_STATE_FILE, StateStore
 
 # ==========================================
 # FastAPI 应用
@@ -622,15 +622,23 @@ def health_check():
 
 @app.post("/api/reload-modules")
 def reload_modules():
-    """Hot-reload QA/search modules without restarting the server (keeps model in memory)."""
+    """Hot-reload QA/search modules, then rebuild the engine lazily."""
     import importlib
     import aerospace_search_main
     import aerospace_qa
+    import qa.evidence
+    import qa.entry
+    import qa.prompt
+    import qa.response
+    import qa.structured
     import utils.structure
-    _reset_engine()
-    _reset_db_manager()
     try:
-        importlib.reload(aerospace_structure)
+        importlib.reload(utils.structure)
+        importlib.reload(qa.prompt)
+        importlib.reload(qa.evidence)
+        importlib.reload(qa.response)
+        importlib.reload(qa.structured)
+        importlib.reload(qa.entry)
         importlib.reload(aerospace_search_main)
         importlib.reload(aerospace_qa)
     except Exception as exc:
@@ -641,16 +649,19 @@ def reload_modules():
     globals()["HybridSearch"] = aerospace_search_main.HybridSearch
     globals()["DualDBManager"] = aerospace_search_main.DualDBManager
     globals()["IndexOperationResult"] = aerospace_search_main.IndexOperationResult
+    # Rebuild engine/db lazily on next request so they pick up reloaded code
+    _reset_engine()
+    _reset_db_manager()
     return {"status": "ok", "message": "Modules reloaded successfully"}
 
 
 # ==========================================
 # 3. 知识库 / 文档管理状态
 # ==========================================
-UPLOAD_DIR = Path(__file__).parent / "aerospace_docs"
+UPLOAD_DIR = Path(__file__).resolve().parent.parent / "aerospace_docs"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-STATE_FILE = Path(__file__).parent / "management_state.json"
+STATE_FILE = DEFAULT_STATE_FILE
 _state_store = StateStore(STATE_FILE)
 HEALTH_REPORT_FILE = Path(__file__).parent / "document_health_reports.json"
 _DOCUMENT_TYPE_SUFFIX = {

@@ -1,23 +1,41 @@
 
-from search.common import logger
-import logging
-import math
-import os
-import re
-from functools import lru_cache
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import fitz
-from openai import OpenAI
+from search.common import logger
+from search.hybrid_search import HybridSearch
+from search.query_analysis import analyze_query_intent
+from utils.retrieval_contract import apply_contract, build_retrieval_contract
+from utils.structure import (
+    answer_structural_classification,
+    answer_structural_count,
+    answer_structural_definition,
+    load_all_structural_records,
+)
 
-from utils.evidence_scores import ensure_evidence_score_fields, evidence_display_score, evidence_ranking_score
-from utils.structure import answer_structural_classification, answer_structural_count, answer_structural_definition, load_all_structural_records
-from aerospace_search_main import HybridSearch, analyze_query_intent, infer_query_precision_hints
-from utils.retrieval_contract import RetrievalContract, apply_contract, build_retrieval_contract
-
-from search.hybrid_search import HybridSearch, logger
-from search.query_analysis import analyze_query_intent, logger
+from .evidence import _repair_response_sources, _select_prompt_evidence
+from .prompt import (
+    BASE_SYSTEM_PROMPT,
+    _build_contextual_search_query,
+    build_context,
+    build_user_prompt,
+    call_qwen,
+    prepare_prompt_evidence,
+)
+from .response import (
+    _abstain_message,
+    _abstain_payload,
+    _estimate_confidence,
+    _finalized_contract_answer_or_none,
+    _llm_unavailable_message,
+    _normalize_response_source,
+    _search_error_message,
+)
+from .structured import (
+    _definition_query_term,
+    _is_valid_query,
+    _try_answer_article_count,
+    _try_answer_document_applicability,
+)
 
 def ask(query: str, engine: HybridSearch = None) -> str:
     payload = ask_structured(query, engine=engine)

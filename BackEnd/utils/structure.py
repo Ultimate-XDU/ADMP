@@ -1276,7 +1276,7 @@ def _resolve_doc_name_for_definition(query: str) -> str:
         return ""
     best_len = 0
     best_name = ""
-    for file_path in (BASE_DIR / "aerospace_docs").glob("*"):
+    for file_path in (BASE_DIR.parent / "aerospace_docs").glob("*"):
         if file_path.suffix.lower() not in {".pdf", ".docx"}:
             continue
         stem_key = _compact_text(file_path.stem)

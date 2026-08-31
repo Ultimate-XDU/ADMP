@@ -4,17 +4,16 @@ import re
 import threading
 import unicodedata
 from dataclasses import asdict, dataclass, field
-from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from utils.evidence_scores import evidence_ranking_score
 from utils.query_utils import compact_query_text, cross_lingual_query_terms, classify_query_intent
-from utils.state_store import load_state
+from utils.state_store import DEFAULT_STATE_FILE, load_state
 
 
 BASE_DIR = Path(__file__).resolve().parent
-DOC_DIR = BASE_DIR / "aerospace_docs"
+DOC_DIR = BASE_DIR.parent / "aerospace_docs"
 STRUCTURAL_RECORD_DIR = BASE_DIR / "structural_records"
 _CORPUS_DOCUMENTS_CACHE_LOCK = threading.RLock()
 
@@ -796,7 +795,10 @@ class EvidenceCoveragePolicy:
         )
 
 
-@lru_cache(maxsize=1)
+_corpus_documents_cache: Tuple[CorpusDocument, ...] = ()
+_corpus_documents_cache_stamp: Optional[Tuple[int, ...]] = None
+
+
 def _load_corpus_documents_cached() -> Tuple[CorpusDocument, ...]:
     records: Dict[str, CorpusDocument] = {}
     payload = load_state()
@@ -833,14 +835,33 @@ def _load_corpus_documents_cached() -> Tuple[CorpusDocument, ...]:
     return tuple(sorted(records.values(), key=lambda item: item.storage_file_name))
 
 
+def _corpus_cache_stamp() -> Tuple[int, ...]:
+    stamps: List[int] = []
+    for target in (DEFAULT_STATE_FILE, DOC_DIR):
+        try:
+            stat = target.stat()
+        except OSError:
+            stamps.append(0)
+        else:
+            stamps.extend((stat.st_mtime_ns, stat.st_size))
+    return tuple(stamps)
+
+
 def load_corpus_documents() -> Tuple[CorpusDocument, ...]:
+    global _corpus_documents_cache, _corpus_documents_cache_stamp
     with _CORPUS_DOCUMENTS_CACHE_LOCK:
-        return _load_corpus_documents_cached()
+        stamp = _corpus_cache_stamp()
+        if _corpus_documents_cache_stamp != stamp:
+            _corpus_documents_cache = _load_corpus_documents_cached()
+            _corpus_documents_cache_stamp = stamp
+        return _corpus_documents_cache
 
 
 def clear_contract_caches() -> None:
+    global _corpus_documents_cache, _corpus_documents_cache_stamp
     with _CORPUS_DOCUMENTS_CACHE_LOCK:
-        _load_corpus_documents_cached.cache_clear()
+        _corpus_documents_cache = ()
+        _corpus_documents_cache_stamp = None
 
 
 def _quoted_fragments(query: str) -> Tuple[str, ...]:

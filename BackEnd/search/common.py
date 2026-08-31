@@ -98,7 +98,49 @@ METADATA_CACHE_MAX_ITEMS = max(_env_int("AEROSPACE_METADATA_CACHE_MAX_ITEMS", 40
 
 BASE_DIR = Path(__file__).resolve().parent
 
-DOC_DIR = str(BASE_DIR / "aerospace_docs")
+DOC_DIR = str(BASE_DIR.parent / "aerospace_docs")
+
+
+def _consolidate_legacy_doc_dirs() -> None:
+    canonical_dir = Path(DOC_DIR)
+    legacy_dirs = (
+        BASE_DIR / "aerospace_docs",
+        BASE_DIR.parent / "api" / "aerospace_docs",
+        BASE_DIR.parent / "utils" / "aerospace_docs",
+    )
+    moved: list[str] = []
+    skipped: list[str] = []
+    for legacy in legacy_dirs:
+        try:
+            if not legacy.is_dir():
+                continue
+            for item in legacy.iterdir():
+                if not item.is_file():
+                    continue
+                dest = canonical_dir / item.name
+                if dest.exists():
+                    skipped.append(item.name)
+                    continue
+                os.replace(item, dest)
+                moved.append(item.name)
+            if not any(legacy.iterdir()):
+                legacy.rmdir()
+        except OSError as exc:
+            logger.warning("合并旧文档目录 %s 失败：%s", legacy, exc)
+    if moved or skipped:
+        logger.warning(
+            "已将旧目录中的文档合并到 %s：移动 %d 个，同名跳过 %d 个；旧目录为空时已删除。",
+            canonical_dir,
+            len(moved),
+            len(skipped),
+        )
+
+
+try:
+    Path(DOC_DIR).mkdir(parents=True, exist_ok=True)
+    _consolidate_legacy_doc_dirs()
+except OSError:
+    pass
 
 HEALTH_REPORT_FILE = BASE_DIR / "document_health_reports.json"
 

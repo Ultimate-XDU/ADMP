@@ -20,9 +20,8 @@ from search.evidence_scoring import _has_unmodified_subject, logger
 from search.hybrid_search import HybridSearch, logger
 from search.query_analysis import analyze_query_intent, infer_query_precision_hints, logger
 
-def _compact_evidence_text(value: str) -> str:
-    return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9.]+", "", str(value or "").lower())
-
+from ._shared import _compact_evidence_text, _is_structural_evidence
+from .prompt import _resolve_doc_name_from_text
 
 def _query_terms(query: str) -> List[str]:
     terms = re.findall(r"[\u4e00-\u9fff]{2,}|[A-Za-z0-9.]{2,}", str(query or ""))
@@ -48,12 +47,6 @@ def _evidence_haystack(row: Dict) -> str:
             "content",
         )
     )
-
-
-def _is_structural_evidence(row: Dict) -> bool:
-    source_type = str(row.get("source_type") or "")
-    layout_type = str(row.get("layout_type") or "")
-    return source_type.startswith("structural") or layout_type == "structural" or bool(row.get("structural_node_id"))
 
 
 def _has_unmodified_subject(text: str, subject: str, modifiers: tuple[str, ...] = ("出口", "外国", "特殊", "标准", "临时", "限制", "生产", "型号")) -> bool:

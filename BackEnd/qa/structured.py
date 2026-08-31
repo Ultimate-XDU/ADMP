@@ -16,6 +16,31 @@ from utils.retrieval_contract import RetrievalContract, apply_contract, build_re
 
 from search.common import DOC_DIR, logger
 
+_ARTICLE_COUNT_MARKERS = (
+    "一共有几条",
+    "共有几条",
+    "总共几条",
+    "有多少条",
+    "共多少条",
+    "几条",
+    "多少条",
+)
+
+_CN_NUMERAL_VALUES = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+
 def _normalize_lookup_text(value: str) -> str:
     return re.sub(r"[^\w\u4e00-\u9fff]+", "", str(value or "").lower())
 

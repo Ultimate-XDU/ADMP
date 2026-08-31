@@ -262,6 +262,50 @@ def _extract_layout_dets(page_data: Any) -> List[Dict[str, Any]]:
     return layout_dets
 
 
+def _extract_page_size(page_data: Any) -> Optional[Tuple[float, float]]:
+    for attr in ("page_size", "size", "page_dim", "dimensions"):
+        value = getattr(page_data, attr, None)
+        if value is None and isinstance(page_data, dict):
+            value = page_data.get(attr)
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            try:
+                width, height = float(value[0]), float(value[1])
+            except (TypeError, ValueError):
+                continue
+            if width > 1.0 and height > 1.0:
+                return width, height
+    width = getattr(page_data, "width", None)
+    height = getattr(page_data, "height", None)
+    if width is None and isinstance(page_data, dict):
+        width = page_data.get("width")
+    if height is None and isinstance(page_data, dict):
+        height = page_data.get("height")
+    try:
+        width, height = float(width), float(height)
+    except (TypeError, ValueError):
+        return None
+    if width > 1.0 and height > 1.0:
+        return width, height
+    return None
+
+
+def _normalize_mineru_bbox(bbox: List[float], page_size: Optional[Tuple[float, float]]) -> Optional[dict]:
+    x0, y0, x1, y1 = bbox
+    if page_size is not None:
+        import fitz
+        from search.document_pipeline import _normalize_bbox
+        return _normalize_bbox((x0, y0, x1, y1), fitz.Rect(0, 0, page_size[0], page_size[1]))
+    if all(0.0 <= value <= 1.0 for value in (x0, y0, x1, y1)):
+        return {
+            "x": round(max(0.0, x0), 6),
+            "y": round(max(0.0, y0), 6),
+            "width": round(max(0.0, x1 - x0), 6),
+            "height": round(max(0.0, y1 - y0), 6),
+        }
+    logger.debug("Dropping MinerU bbox %s: unknown coordinate space", bbox)
+    return None
+
+
 # ============================================================================
 # MinerU PDF parser
 # ============================================================================
@@ -335,12 +379,6 @@ class MinerUParser:
             raise RuntimeError(f"MinerU not available: {get_mineru_install_error()}")
 
         from search.common import infer_document_type
-        from search.document_pipeline import (
-            _bbox_union,
-            _is_repeating_pdf_noise,
-            _materialize_text_units,
-            _normalize_bbox,
-        )
 
         if not document_type:
             document_type = infer_document_type(doc_name)
@@ -496,11 +534,12 @@ class MinerUParser:
 
         total_score = 0.0
         item_count = 0
+        page_size = _extract_page_size(page_data)
 
         for item in normalized_items:
             item_type = item["type"]
             score = item["score"]
-            bbox = item["bbox"]
+            bbox = _normalize_mineru_bbox(item["bbox"], page_size)
 
             # Skip very low confidence items
             if score < MINERU_MIN_CONFIDENCE:
@@ -522,7 +561,7 @@ class MinerUParser:
                                 content=markdown,
                                 page_number=page_number,
                                 page_count=page_count,
-                                bbox={"x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]},
+                                bbox=bbox,
                                 layout_type="table",
                                 parse_confidence=score,
                                 is_ocr_fallback=False,
@@ -549,7 +588,7 @@ class MinerUParser:
                         content=text,
                         page_number=page_number,
                         page_count=page_count,
-                        bbox={"x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]},
+                        bbox=bbox,
                         layout_type="single_column",
                         parse_confidence=score,
                         is_ocr_fallback=False,
@@ -571,7 +610,7 @@ class MinerUParser:
                         content=formula_text,
                         page_number=page_number,
                         page_count=page_count,
-                        bbox={"x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]},
+                        bbox=bbox,
                         layout_type="single_column",
                         parse_confidence=score,
                         is_ocr_fallback=False,
@@ -594,7 +633,7 @@ class MinerUParser:
                         content=text,
                         page_number=page_number,
                         page_count=page_count,
-                        bbox={"x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]},
+                        bbox=bbox,
                         layout_type="single_column",
                         parse_confidence=score,
                         is_ocr_fallback=False,
@@ -612,7 +651,7 @@ class MinerUParser:
                     content=text,
                     page_number=page_number,
                     page_count=page_count,
-                    bbox={"x0": bbox[0], "y0": bbox[1], "x1": bbox[2], "y1": bbox[3]},
+                    bbox=bbox,
                     layout_type="multi_column" if stats["multi_column"] else "single_column",
                     parse_confidence=score,
                     is_ocr_fallback=False,
