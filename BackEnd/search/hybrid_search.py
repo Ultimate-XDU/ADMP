@@ -97,6 +97,7 @@ from search.common import (
     _doc_alias_keys,
     _extract_highlight_text,
     _lru_cache_get,
+    _lru_cache_lock,
     _lru_cache_put,
     _ngram_similarity,
     _normalize_heading_value,
@@ -212,6 +213,12 @@ class HybridSearch:
         except Exception:
             logger.debug("Elasticsearch client close failed", exc_info=True)
         _release_milvus_connection()
+
+    def invalidate_caches(self) -> None:
+        """Drop in-memory caches after index changes without rebuilding clients/models."""
+        with _lru_cache_lock:
+            self._pdf_page_cache.clear()
+            self._metadata_cache.clear()
 
     def __enter__(self) -> "HybridSearch":
         return self
@@ -1158,16 +1165,36 @@ class HybridSearch:
     def _get_metadata_batch(self, chunk_ids: List[str]) -> Dict[str, dict]:
         if not chunk_ids:
             return {}
-        missing_ids = [chunk_id for chunk_id in chunk_ids if chunk_id not in self._metadata_cache]
+        cached: Dict[str, dict] = {}
+        missing_ids: List[str] = []
+        for chunk_id in chunk_ids:
+            row = _lru_cache_get(self._metadata_cache, chunk_id)
+            if row is None:
+                missing_ids.append(chunk_id)
+            else:
+                cached[chunk_id] = row
         if missing_ids:
             try:
-                response = self.es_client.mget(index=ES_INDEX, body={"ids": missing_ids})
+                response = self.es_client.mget(
+                    index=ES_INDEX,
+                    body={"ids": missing_ids},
+                    request_timeout=ES_REQUEST_TIMEOUT_SECONDS,
+                )
             except Exception:
                 response = {"docs": []}
             for document in response.get("docs", []):
                 if document.get("found"):
-                    self._metadata_cache[document["_id"]] = document["_source"]
-        return {chunk_id: self._metadata_cache.get(chunk_id, {}) for chunk_id in chunk_ids if self._metadata_cache.get(chunk_id)}
+                    _lru_cache_put(
+                        self._metadata_cache,
+                        document["_id"],
+                        document["_source"],
+                        METADATA_CACHE_MAX_ITEMS,
+                    )
+            for chunk_id in missing_ids:
+                row = _lru_cache_get(self._metadata_cache, chunk_id)
+                if row is not None:
+                    cached[chunk_id] = row
+        return cached
 
     def _get_chunk_context(self, chunk_id: str, context_size: int = 1) -> Dict:
         current = self._get_metadata(chunk_id)

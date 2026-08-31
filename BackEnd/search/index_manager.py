@@ -26,7 +26,6 @@ from search.common import (
     EMBEDDING_MODEL,
     ES_HOST,
     ES_INDEX,
-    ES_QUERY_TIMEOUT_SECONDS,
     ES_REQUEST_TIMEOUT_SECONDS,
     IndexOperationResult,
     MAX_CHUNK_SIZE,
@@ -576,14 +575,39 @@ class DualDBManager:
 
     def _remove_doc_from_milvus(self, collection: Collection, doc_name: str):
         try:
+            chunk_ids: List[str] = []
             response = self.es_client.options(request_timeout=ES_REQUEST_TIMEOUT_SECONDS).search(
                 index=ES_INDEX,
-                body={"query": {"term": {"doc_name": doc_name}}, "_source": ["chunk_id"], "size": 10000},
-                timeout=f"{math.ceil(ES_QUERY_TIMEOUT_SECONDS)}s",
+                body={"query": {"term": {"doc_name": doc_name}}, "_source": ["chunk_id"], "size": 1000},
+                scroll="2m",
             )
-            chunk_ids = [hit["_source"]["chunk_id"] for hit in response["hits"]["hits"]]
-            if chunk_ids:
-                quoted_chunk_ids = ", ".join(json.dumps(str(chunk_id), ensure_ascii=False) for chunk_id in chunk_ids)
+            scroll_id = response.get("_scroll_id")
+            try:
+                while True:
+                    hits = response.get("hits", {}).get("hits", [])
+                    chunk_ids.extend(
+                        chunk_id
+                        for chunk_id in (str(hit.get("_source", {}).get("chunk_id") or "") for hit in hits)
+                        if chunk_id
+                    )
+                    if not scroll_id or len(hits) < 1000:
+                        break
+                    response = self.es_client.options(request_timeout=ES_REQUEST_TIMEOUT_SECONDS).scroll(
+                        scroll_id=scroll_id,
+                        scroll="2m",
+                    )
+            finally:
+                if scroll_id:
+                    try:
+                        self.es_client.clear_scroll(scroll_id=scroll_id)
+                    except Exception:
+                        pass
+            if not chunk_ids:
+                return
+            delete_batch_size = 1000
+            for start in range(0, len(chunk_ids), delete_batch_size):
+                batch = chunk_ids[start : start + delete_batch_size]
+                quoted_chunk_ids = ", ".join(json.dumps(chunk_id, ensure_ascii=False) for chunk_id in batch)
                 collection.delete(f"chunk_id in [{quoted_chunk_ids}]")
         except Exception as exc:
             logger.warning("从 Milvus 删除文档失败 doc_name=%s: %s", doc_name, exc)

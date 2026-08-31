@@ -16,6 +16,7 @@ from typing import Any, Optional
 import fitz
 from elasticsearch import Elasticsearch
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -49,11 +50,22 @@ if not logging.getLogger().handlers:
 logger = logging.getLogger(__name__)
 app = FastAPI(title="航空航天知识检索 API", version="1.0.0")
 
+_cors_env = os.environ.get("AEROSPACE_CORS_ORIGINS", "")
+if _cors_env.strip() == "*":
+    _cors_origins = ["*"]
+else:
+    _cors_origins = [origin.strip() for origin in _cors_env.split(",") if origin.strip()] or [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -70,7 +82,8 @@ def get_engine():
                 try:
                     _engine = HybridSearch(hyde_llm_call=call_qwen)
                 except Exception as exc:
-                    raise HTTPException(status_code=503, detail=f"检索服务不可用，请先启动 Elasticsearch 和 Milvus：{exc}") from exc
+                    logger.exception("检索引擎初始化失败")
+                    raise HTTPException(status_code=503, detail="检索服务不可用，请先确认 Elasticsearch 与 Milvus 已启动") from exc
     return _engine
 
 
@@ -99,6 +112,16 @@ def _reset_db_manager() -> None:
         _db_manager = None
     if old_manager is not None:
         _close_resource(old_manager)
+
+
+def _invalidate_engine_caches() -> None:
+    engine = _engine
+    if engine is None:
+        return
+    try:
+        engine.invalidate_caches()
+    except Exception:
+        logger.debug("引擎缓存失效处理失败", exc_info=True)
 
 
 @app.on_event("shutdown")
@@ -554,7 +577,7 @@ def search_endpoint(req: QARequest):
         results = engine.search_for_qa(question)
     except RuntimeError as exc:
         logger.warning("检索接口执行失败 question=%s: %s", question, exc)
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise HTTPException(status_code=503, detail="检索服务暂时不可用，请稍后重试") from exc
     return {"results": results}
 
 
@@ -578,7 +601,8 @@ def evidence_page_image(
     except IndexError:
         raise HTTPException(status_code=404, detail=f"页码越界: {page}") from None
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"生成预览失败: {exc}") from exc
+        logger.warning("生成预览失败 doc=%s page=%s: %s", resolved_name, page, exc)
+        raise HTTPException(status_code=500, detail="生成预览失败，请稍后重试") from exc
 
     return StreamingResponse(
         io.BytesIO(png_bytes),
@@ -606,12 +630,12 @@ def health_check():
             details["milvus"] = True
         except Exception as exc:
             details["milvus"] = False
-            details["milvusDetail"] = str(exc)
+            details["milvusDetail"] = type(exc).__name__
             status = "degraded"
     except Exception as exc:
         details["elasticsearch"] = False
         details["milvus"] = False
-        details["dbDetail"] = str(exc)
+        details["dbDetail"] = type(exc).__name__
         status = "degraded"
 
     if not details["uploadDir"]:
@@ -1146,9 +1170,9 @@ def _delete_document_assets(record: dict):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"删除索引失败: {storage_file_name}: {exc}") from exc
-    global _engine
-    _engine = None
+        logger.warning("删除索引失败 doc=%s: %s", storage_file_name, exc)
+        raise HTTPException(status_code=503, detail=f"删除索引失败: {storage_file_name}") from exc
+    _invalidate_engine_caches()
 
     file_path = UPLOAD_DIR / storage_file_name
     if file_path.exists():
@@ -1309,8 +1333,16 @@ def delete_document(doc_id: int):
 # ==========================================
 # 5. 文档上传（接收文件，存入 aerospace_docs 目录）
 # ==========================================
+def _max_upload_bytes() -> int:
+    try:
+        max_mb = int(os.environ.get("AEROSPACE_MAX_UPLOAD_MB", "200"))
+    except (TypeError, ValueError):
+        max_mb = 200
+    return max(max_mb, 1) * 1024 * 1024
+
+
 @app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(file: UploadFile = File(...), overwrite: bool = Query(False)):
     if not file.filename:
         raise HTTPException(status_code=400, detail="未提供文件")
 
@@ -1321,27 +1353,42 @@ async def upload_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="仅支持 PDF、DOCX、PPTX、XLSX 文件")
 
     dest = UPLOAD_DIR / safe_name
-    temp_dest = dest.with_suffix(f"{dest.suffix}.uploading")
+    if dest.exists() and not overwrite:
+        raise HTTPException(status_code=409, detail=f"已存在同名文件: {safe_name}，如需覆盖请重试并指定 overwrite")
+
+    temp_dest = dest.with_name(f"{dest.name}.{uuid.uuid4().hex}.uploading")
+    max_bytes = _max_upload_bytes()
     total_bytes = 0
-    try:
-        if temp_dest.exists():
-            temp_dest.unlink()
+
+    def _write_sync() -> None:
+        nonlocal total_bytes
         with temp_dest.open("wb") as output:
             while True:
-                chunk = await file.read(1024 * 1024)
+                chunk = file.file.read(1024 * 1024)
                 if not chunk:
                     break
-                output.write(chunk)
                 total_bytes += len(chunk)
+                if total_bytes > max_bytes:
+                    raise HTTPException(status_code=413, detail="文件超过大小限制")
+                output.write(chunk)
+
+    def _cleanup_temp() -> None:
+        try:
+            if temp_dest.exists():
+                temp_dest.unlink()
+        except OSError:
+            pass
+
+    try:
+        await run_in_threadpool(_write_sync)
         temp_dest.replace(dest)
+    except HTTPException:
+        _cleanup_temp()
+        raise
     except Exception as exc:
-        for candidate in (temp_dest,):
-            try:
-                if candidate.exists():
-                    candidate.unlink()
-            except OSError:
-                pass
-        raise HTTPException(status_code=500, detail=f"保存上传文件失败: {exc}") from exc
+        _cleanup_temp()
+        logger.warning("保存上传文件失败 name=%s: %s", safe_name, exc)
+        raise HTTPException(status_code=500, detail=f"保存上传文件失败: {safe_name}") from exc
     finally:
         await file.close()
 
@@ -1419,9 +1466,10 @@ def index_document(req: IndexRequest):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"增量索引失败: {exc}") from exc
-    # 索引成功后，需要重新初始化搜索引擎以加载新数据
-    _reset_engine()
+        logger.warning("增量索引失败 file=%s: %s", storage_file_name, exc)
+        raise HTTPException(status_code=503, detail=f"增量索引失败: {storage_file_name}") from exc
+    # 索引成功后，失效引擎内存缓存即可，无需整体重建模型与连接
+    _invalidate_engine_caches()
     # 从结果中提取块数（使用正则，避免文件名中含“共”导致误解析）
     chunk_count = result.chunk_count if result.chunk_count > 0 else _extract_chunk_count_from_message(result.message)
     _update_document_index_state(storage_file_name, chunk_count, status="SYNCED")
@@ -1445,8 +1493,9 @@ def rebuild_index():
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"重建索引失败: {exc}") from exc
-    _reset_engine()
+        logger.warning("重建索引失败: %s", exc)
+        raise HTTPException(status_code=503, detail="重建索引失败，请稍后重试") from exc
+    _invalidate_engine_caches()
     _sync_document_index_state_from_reports()
     return {
         "message": result.message,
@@ -1469,8 +1518,9 @@ def remove_document_index(doc_name: str):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"删除索引失败: {resolved_name}: {exc}") from exc
-    _reset_engine()
+        logger.warning("删除索引失败 doc=%s: %s", resolved_name, exc)
+        raise HTTPException(status_code=503, detail=f"删除索引失败: {resolved_name}") from exc
+    _invalidate_engine_caches()
     _update_document_index_state(resolved_name, 0, status="READY")
     return {
         "message": result.message,
@@ -1579,8 +1629,9 @@ def classify_document(req: ClassifyRequest):
                 newKbDescription=data.get("newDescription", ""),
                 reason=data.get("reason", ""),
             )
-    except Exception as e:
-        return ClassifyResponse(reason=f"分类失败: {str(e)}")
+    except Exception:
+        logger.warning("知识库分类失败 fileName=%s", req.fileName, exc_info=True)
+        return ClassifyResponse(reason="分类服务暂时不可用，请手动选择知识库")
 
 
 # ==========================================

@@ -474,18 +474,23 @@ def _release_milvus_connection() -> None:
             connections.disconnect("default")
 
 
+_lru_cache_lock = threading.RLock()
+
+
 def _lru_cache_get(cache: OrderedDict, key: str):
-    if key not in cache:
-        return None
-    cache.move_to_end(key)
-    return cache[key]
+    with _lru_cache_lock:
+        if key not in cache:
+            return None
+        cache.move_to_end(key)
+        return cache[key]
 
 
 def _lru_cache_put(cache: OrderedDict, key: str, value, max_items: int) -> None:
-    cache[key] = value
-    cache.move_to_end(key)
-    while len(cache) > max_items:
-        cache.popitem(last=False)
+    with _lru_cache_lock:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > max_items:
+            cache.popitem(last=False)
 
 
 @dataclass(frozen=True)
