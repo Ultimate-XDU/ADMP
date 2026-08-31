@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from __future__ import annotations
 
 import argparse
@@ -18,9 +22,9 @@ from docx import Document as DocxDocument
 
 os.environ.setdefault("AEROSPACE_SKIP_UPLOAD_DIR_SYNC", "1")
 
-from aerospace_api import ClassifyRequest, classify_document
+from api.aerospace_api import ClassifyRequest, classify_document
 from aerospace_search_main import DOC_DIR
-from management_state_store import load_state, update_state
+from utils.state_store import load_state, update_state
 
 
 BASE_DIR = Path(__file__).resolve().parent

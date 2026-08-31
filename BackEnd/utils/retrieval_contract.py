@@ -8,9 +8,9 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from aerospace_evidence_scores import evidence_ranking_score
-from aerospace_query_utils import compact_query_text, cross_lingual_query_terms, classify_query_intent
-from management_state_store import load_state
+from utils.evidence_scores import evidence_ranking_score
+from utils.query_utils import compact_query_text, cross_lingual_query_terms, classify_query_intent
+from utils.state_store import load_state
 
 
 BASE_DIR = Path(__file__).resolve().parent

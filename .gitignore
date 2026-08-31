@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.log
+*.bak
 *.sqlite
 *.sqlite3
 .DS_Store
@@ -10,8 +11,10 @@ Thumbs.db
 # Local runtime artifacts
 BackEnd/aerospace_docs/
 BackEnd/structural_records/
+BackEnd/data/knowledge_graph/
 BackEnd/chat_history.sqlite3
 BackEnd/backend*.log
+*.bak
 BackEnd/backend*.err.log
 BackEnd/backend*.out.log
 BackEnd/model_download.log

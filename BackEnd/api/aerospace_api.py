@@ -34,8 +34,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from aerospace_search_main import ES_HOST, ES_INDEX, HybridSearch, DualDBManager, IndexOperationResult
 from aerospace_qa import ask_structured, call_qwen
-from aerospace_retrieval_contract import clear_contract_caches
-from management_state_store import StateStore
+from utils.retrieval_contract import clear_contract_caches
+from utils.state_store import StateStore
 
 # ==========================================
 # FastAPI 应用
@@ -626,7 +626,7 @@ def reload_modules():
     import importlib
     import aerospace_search_main
     import aerospace_qa
-    import aerospace_structure
+    import utils.structure
     _reset_engine()
     _reset_db_manager()
     try:

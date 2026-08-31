@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from __future__ import annotations
 
 import argparse
@@ -16,7 +20,7 @@ from docx import Document as DocxDocument
 import fitz
 
 from aerospace_search_main import DOC_DIR, DualDBManager
-from management_state_store import load_state, update_document_state, update_state
+from utils.state_store import load_state, update_document_state, update_state
 
 
 BASE_DIR = Path(__file__).resolve().parent

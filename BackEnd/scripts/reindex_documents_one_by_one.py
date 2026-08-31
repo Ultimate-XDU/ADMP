@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from __future__ import annotations
 
 import argparse
@@ -11,8 +15,8 @@ from elasticsearch import Elasticsearch
 import torch
 
 from aerospace_search_main import DOC_DIR, EMBEDDING_MODEL, ES_HOST, ES_INDEX, RERANK_MODEL, VECTOR_DIM, DualDBManager
-from aerospace_structure import clear_structural_records
-from management_state_store import update_document_state
+from utils.structure import clear_structural_records
+from utils.state_store import update_document_state
 
 
 BASE_DIR = Path(__file__).resolve().parent
