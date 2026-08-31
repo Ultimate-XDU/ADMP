@@ -1167,7 +1167,11 @@ class HybridSearch:
             return {}
         cached: Dict[str, dict] = {}
         missing_ids: List[str] = []
+        seen_ids = set()
         for chunk_id in chunk_ids:
+            if not chunk_id or chunk_id in seen_ids:
+                continue
+            seen_ids.add(chunk_id)
             row = _lru_cache_get(self._metadata_cache, chunk_id)
             if row is None:
                 missing_ids.append(chunk_id)
@@ -1197,30 +1201,60 @@ class HybridSearch:
         return cached
 
     def _get_chunk_context(self, chunk_id: str, context_size: int = 1) -> Dict:
-        current = self._get_metadata(chunk_id)
+        current = self._get_metadata_batch([chunk_id]).get(chunk_id, {})
         if not current:
             return {}
 
         prev_blocks = []
         prev_id = current.get("prev_id", "")
-        while prev_id and len(prev_blocks) < context_size:
-            row = self._get_metadata(prev_id)
-            if not row:
-                break
-            prev_blocks.insert(0, row)
-            prev_id = row.get("prev_id", "")
-
         next_blocks = []
         next_id = current.get("next_id", "")
-        while next_id and len(next_blocks) < context_size:
-            row = self._get_metadata(next_id)
-            if not row:
+        parent_id = current.get("parent_id", "")
+        parent = None
+        for depth in range(max(0, context_size)):
+            requested_ids = [prev_id, next_id]
+            if depth == 0 and parent_id:
+                requested_ids.append(parent_id)
+            rows = self._get_metadata_batch(requested_ids)
+            if depth == 0 and parent_id:
+                parent = rows.get(parent_id)
+            if prev_id:
+                row = rows.get(prev_id)
+                if row:
+                    prev_blocks.insert(0, row)
+                    prev_id = row.get("prev_id", "")
+                else:
+                    prev_id = ""
+            if next_id:
+                row = rows.get(next_id)
+                if row:
+                    next_blocks.append(row)
+                    next_id = row.get("next_id", "")
+                else:
+                    next_id = ""
+            if not prev_id and not next_id:
                 break
-            next_blocks.append(row)
-            next_id = row.get("next_id", "")
-
-        parent = self._get_metadata(current.get("parent_id", "")) if current.get("parent_id") else None
         return {"current": current, "prev": prev_blocks, "next": next_blocks, "parent": parent}
+
+    def _prefetch_evidence_context(self, hits: List[dict], structural_depth: int, following_depth: int) -> None:
+        """Warm evidence metadata in bounded ``mget`` rounds."""
+        seed_ids = [str(hit.get("chunk_id") or "") for hit in hits]
+        rows = self._get_metadata_batch(seed_ids)
+        frontier = list(rows.values())
+        max_hops = max(1, min(max(structural_depth, following_depth), 12))
+        for _ in range(max_hops):
+            requested_ids = {
+                str(row.get(field) or "")
+                for row in frontier
+                for field in ("prev_id", "next_id", "parent_id")
+                if row.get(field)
+            }
+            if not requested_ids:
+                return
+            next_rows = self._get_metadata_batch(list(requested_ids))
+            if not next_rows:
+                return
+            frontier = list(next_rows.values())
 
     def _expand_heading_children(self, current: dict, max_children: int, max_chars: int) -> List[str]:
         if not current:
@@ -1933,10 +1967,8 @@ class HybridSearch:
         if unique_aliases and float(profile.get("vec_weight", 1.0)) >= 1.0:
             alias_vecs = self.embedder.encode(unique_aliases, normalize_embeddings=True).tolist()
 
-        # HyDE: generate hypothetical answer for short article_lookup queries
-        # Agent can override: use_hyde=True forces it, use_hyde=False skips it
-        hyde_vec: Optional[List[float]] = None
-        hyde_answer: str = ""
+        # HyDE's remote call runs beside the normal recall paths below rather
+        # than delaying their first result.
         agent_use_hyde = profile.get("agent_use_hyde")
         hyde_condition = (
             self.hyde_llm_call
@@ -1949,16 +1981,18 @@ class HybridSearch:
                 )
             )
         )
-        if hyde_condition:
-            hyde_answer = _generate_hypothetical_answer(query, self.hyde_llm_call)
-            if hyde_answer:
-                hyde_vec = self.embedder.encode([hyde_answer], normalize_embeddings=True)[0].tolist()
-
         def _run_vec_search(vec: List[float], label: str):
             results = self._vector_search(vec, recall.vector)
             for hit in results:
                 hit["channels"] = list(hit.get("channels", [])) + [label]
             return results
+
+        def _run_hyde_search() -> Tuple[str, List[dict]]:
+            hyde_answer = _generate_hypothetical_answer(query, self.hyde_llm_call)
+            if not hyde_answer:
+                return "", []
+            hyde_vec = self.embedder.encode([hyde_answer], normalize_embeddings=True)[0].tolist()
+            return hyde_answer, _run_vec_search(hyde_vec, "hyde")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             # Submit only enabled channels (agent can disable channels for speed)
@@ -1969,6 +2003,7 @@ class HybridSearch:
             heading_future = executor.submit(self._heading_search, query, profile, recall.heading) if _channel_enabled("heading") else None
             table_future = executor.submit(self._table_search, query, profile, recall.table) if _channel_enabled("table") else None
             target_doc_future = executor.submit(self._target_document_search, query, profile, recall.target_document) if _channel_enabled("target_document") else None
+            hyde_future = executor.submit(_run_hyde_search) if hyde_condition and _channel_enabled("vector") else None
 
             # Alias vector searches only if vector channel is enabled
             alias_futures = {}
@@ -1996,15 +2031,11 @@ class HybridSearch:
 
             for label, future in alias_futures.items():
                 recall_groups.append((label, future.result(), profile["vec_weight"] * 0.5))
-            # HyDE search: run hypothetical answer embedding alongside other searches
-            if hyde_vec and _channel_enabled("vector"):
-                hyde_future = executor.submit(_run_vec_search, hyde_vec, "hyde")
-                hyde_results = hyde_future.result()
-                for hit in hyde_results:
-                    hit["channels"] = list(hit.get("channels", [])) + ["hyde"]
-                recall_groups.append(("hyde", hyde_results, profile["vec_weight"] * 0.7))
-                # Store hyde answer in profile for downstream use
-                profile["hyde_answer"] = hyde_answer
+            if hyde_future is not None:
+                hyde_answer, hyde_results = hyde_future.result()
+                if hyde_results:
+                    recall_groups.append(("hyde", hyde_results, profile["vec_weight"] * 0.7))
+                    profile["hyde_answer"] = hyde_answer
 
         fused = self._rrf_fusion(recall_groups, profile)
         if not fused:
@@ -2310,6 +2341,12 @@ class HybridSearch:
             fused, profile = self._search_candidates(query)
             if not fused:
                 return structural_hits[:QA_TOP_K] if structural_hits else []
+
+            self._prefetch_evidence_context(
+                fused[:30],
+                structural_depth=structural_depth,
+                following_depth=max(int(profile.get("expand_children", 4)) * 3, 6),
+            )
 
             results: List[Tuple[float, dict, bool]] = []
             seen_pages = set()

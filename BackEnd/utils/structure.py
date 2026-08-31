@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -10,6 +12,13 @@ from typing import Dict, Iterable, List, Optional, Tuple
 BASE_DIR = Path(__file__).resolve().parent
 STRUCTURAL_RECORD_DIR = BASE_DIR / "structural_records"
 STRUCTURAL_RECORD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Parsed structure records are requested on every QA call. Keep the parsed
+# representation until the on-disk cache file changes, rather than repeatedly
+# decoding the same JSON documents.
+_structural_record_cache: Dict[Path, Tuple[int, List[Dict]]] = {}
+_structural_record_cache_lock = threading.RLock()
+logger = logging.getLogger(__name__)
 
 CN_NUM = "零一二三四五六七八九十百千万两"
 CHAPTER_PATTERN = re.compile(rf"^(?P<label>第\s*[0-9{CN_NUM}]+\s*章|[A-Z]\s*章)\s*(?P<title>.+)?$")
@@ -1511,7 +1520,7 @@ def attach_structure_to_blocks(blocks: List[dict], records: List[Dict]) -> List[
         best = find_best_structure_record(query, candidate_pool(block))
         if not best:
             if progress_interval and index % progress_interval == 0:
-                print(f"    * 结构挂载进度：{index}/{total} 块")
+                logger.info("结构挂载进度：%d/%d 块", index, total)
             continue
         block["structural_node_id"] = best.get("record_id", "")
         block["structural_parent_id"] = best.get("parent_record_id", "")
@@ -1534,25 +1543,49 @@ def attach_structure_to_blocks(blocks: List[dict], records: List[Dict]) -> List[
                 )
             )
         if progress_interval and index % progress_interval == 0:
-            print(f"    * 结构挂载进度：{index}/{total} 块")
+            logger.info("结构挂载进度：%d/%d 块", index, total)
     return blocks
 
 
 def save_structural_records(doc_name: str, records: List[Dict]) -> Path:
     path = _record_cache_path(doc_name)
     path.write_text(json.dumps(_json_utf8_safe(records), ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        return path
+    with _structural_record_cache_lock:
+        _structural_record_cache[path] = (mtime_ns, records)
     return path
 
 
-def load_structural_records(doc_name: str) -> List[Dict]:
-    path = _record_cache_path(doc_name)
+def _load_cached_structural_records(path: Path) -> List[Dict]:
     if not path.exists():
+        with _structural_record_cache_lock:
+            _structural_record_cache.pop(path, None)
         return []
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        return []
+
+    with _structural_record_cache_lock:
+        cached = _structural_record_cache.get(path)
+        if cached is not None and cached[0] == mtime_ns:
+            return cached[1]
+
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return []
-    return payload if isinstance(payload, list) else []
+    records = payload if isinstance(payload, list) else []
+    with _structural_record_cache_lock:
+        _structural_record_cache[path] = (mtime_ns, records)
+    return records
+
+
+def load_structural_records(doc_name: str) -> List[Dict]:
+    return _load_cached_structural_records(_record_cache_path(doc_name))
 
 
 def load_all_structural_records(doc_names: Optional[Iterable[str]] = None) -> List[Dict]:
@@ -1561,17 +1594,14 @@ def load_all_structural_records(doc_names: Optional[Iterable[str]] = None) -> Li
     for path in STRUCTURAL_RECORD_DIR.glob("*.json"):
         if wanted and path.name not in wanted:
             continue
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        if isinstance(payload, list):
-            records.extend(payload)
+        records.extend(_load_cached_structural_records(path))
     return records
 
 
 def remove_structural_records(doc_name: str) -> None:
     path = _record_cache_path(doc_name)
+    with _structural_record_cache_lock:
+        _structural_record_cache.pop(path, None)
     if path.exists():
         path.unlink()
 
@@ -1579,3 +1609,5 @@ def remove_structural_records(doc_name: str) -> None:
 def clear_structural_records() -> None:
     for path in STRUCTURAL_RECORD_DIR.glob("*.json"):
         path.unlink()
+    with _structural_record_cache_lock:
+        _structural_record_cache.clear()

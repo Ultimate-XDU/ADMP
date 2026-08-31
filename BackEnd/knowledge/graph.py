@@ -207,6 +207,53 @@ class KnowledgeGraph:
         self._incoming.setdefault(relation.target_id, []).append(relation)
         return relation
 
+    def remove_document(self, doc_name: str) -> Dict[str, int]:
+        """Remove a document's entities and every relation attached to them.
+
+        Entity IDs are document-scoped, but relations can point to entities
+        created by another document. Rebuild the secondary indexes after the
+        deletion so graph expansion cannot follow a stale edge.
+        """
+        normalized_name = str(doc_name or "").strip()
+        if not normalized_name:
+            return {"entities": 0, "relations": 0}
+
+        entity_ids = {
+            entity_id
+            for entity_id, entity in self._entities.items()
+            if entity.source_doc == normalized_name
+        }
+        removed_relations = [
+            relation
+            for relation in self._relations
+            if relation.source_doc == normalized_name
+            or relation.source_id in entity_ids
+            or relation.target_id in entity_ids
+        ]
+        if not entity_ids and not removed_relations:
+            return {"entities": 0, "relations": 0}
+
+        self._entities = {
+            entity_id: entity
+            for entity_id, entity in self._entities.items()
+            if entity_id not in entity_ids
+        }
+        self._relations = [relation for relation in self._relations if relation not in removed_relations]
+        self._outgoing = {}
+        self._incoming = {}
+        self._by_type = {}
+        self._name_index = {}
+        for entity in self._entities.values():
+            self._by_type.setdefault(entity.type, set()).add(entity.id)
+            for name in [entity.name, *entity.aliases]:
+                key = name.lower().strip()
+                if key:
+                    self._name_index.setdefault(key, []).append(entity.id)
+        for relation in self._relations:
+            self._outgoing.setdefault(relation.source_id, []).append(relation)
+            self._incoming.setdefault(relation.target_id, []).append(relation)
+        return {"entities": len(entity_ids), "relations": len(removed_relations)}
+
     # --- Query operations ---
 
     def get_entity(self, entity_id: str) -> Optional[KnowledgeEntity]:
@@ -732,3 +779,18 @@ def save_global_graph() -> None:
         _global_graph.save(str(graph_path))
     except Exception as exc:
         logger.warning("Failed to save global knowledge graph: %s", exc)
+
+
+def remove_document_from_global_graph(doc_name: str) -> Dict[str, int]:
+    """Drop graph material for one document and persist the updated graph."""
+    graph = get_global_graph()
+    removed = graph.remove_document(doc_name)
+    if removed["entities"] or removed["relations"]:
+        save_global_graph()
+        logger.info(
+            "Removed document %s from knowledge graph: %d entities, %d relations",
+            doc_name,
+            removed["entities"],
+            removed["relations"],
+        )
+    return removed

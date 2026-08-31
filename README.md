@@ -19,8 +19,8 @@ D:\innovat
     structural_records\             本地结构化索引缓存，不提交 Git
   FrontEnd\
     src\App.tsx                     主界面、知识库管理、问答、证据预览
-    src\aviationAssistantMock.ts    前端类型和兜底数据
-    scripts\*.mjs                   依赖检查、构建、预览脚本
+    src\assistant-types.ts          问答会话、引用与证据的数据契约
+    scripts\*.mjs                   依赖检查、构建、开发/生产静态服务脚本
     start.bat                       Windows 前端启动脚本
 ```
 
@@ -31,9 +31,9 @@ D:\innovat
 3. 前端调用 `/api/index` 或 `/api/rebuild-index` 触发索引。
 4. 后端解析文档内容，提取页码、文本块、表格、标题、条款、款项、证据定位信息。
 5. `aerospace_structure.py` 构建结构树，把文档组织成 `doc/chapter/section/article/clause/item/toc` 等结构记录。
-6. `aerospace_search_main.py` 生成检索文本和向量，写入 Elasticsearch 与 Milvus。
+6. `aerospace_search_main.py` 生成检索文本和向量，写入 Elasticsearch 与 Milvus，并同步可选知识图谱。
 7. 用户提问时，前端调用 `/api/qa`。
-8. 后端先分析问题意图，再执行 BM25、向量、结构化记录、标题/条款等多路召回。
+8. 后端先分析问题意图，再执行 BM25、向量、结构化记录、标题/条款等多路召回；相邻证据元数据按批读取，结构记录按文件 mtime 缓存。
 9. 候选证据经过 rerank、结构化优先级、质量门和 PDF 页面上下文补强。
 10. `aerospace_qa.py` 组装 prompt，调用通义千问兼容 OpenAI 接口生成答案。
 11. 后端返回答案、引用来源、页码、bbox、高亮文本和会话记录。
@@ -55,7 +55,8 @@ D:\innovat
 - 按法规/适航资料特点进行语义切块，并保留 `prev_id/next_id/parent_id/heading_path/clause_path` 等上下文链路。
 - 调用 `aerospace_structure.py` 生成结构化记录，并将结构字段回填到 chunk。
 - 写入 Milvus 向量库和 Elasticsearch 关键词索引。
-- 查询时融合向量召回、关键词召回、结构化召回、条款定位、标题匹配和 rerank。
+- 查询时融合向量召回、关键词召回、结构化召回、条款定位、标题匹配和 rerank；HyDE 与主召回并行执行，检索 Agent 会缓存短期策略结果。
+- 文档删除或重建时，同步清理其结构记录和可选知识图谱实体/关系。
 
 `aerospace_structure.py` 是结构化增强层，主要负责：
 
@@ -81,6 +82,7 @@ D:\innovat
 - 问答会话：调用 `/api/qa`，保存和恢复 `/api/chat/conversations`。
 - 证据展示：根据后端返回的 `sources`、`page_number`、`bbox`、`bbox_pages` 展示引用卡片和 PDF 高亮。
 - 删除会话：调用 `/api/chat/conversations/{conversation_id}`。
+- 不再内置虚构的问答场景；后端不可用时会明确展示服务不可用状态。
 
 前端默认 API 前缀是 `/api`。开发环境下 `FrontEnd/vite.config.ts` 会把 `/api` 代理到：
 
@@ -116,6 +118,17 @@ cd FrontEnd
 npm run dev -- --open
 ```
 
+构建后可运行带 API 反代的静态服务：
+
+```powershell
+cd FrontEnd
+npm run build
+$env:API_PROXY_TARGET = "http://127.0.0.1:8787" # 可省略，此为默认值
+npm run serve:dist
+```
+
+`serve:dist` 仅将 `/api/*` 反代至 `API_PROXY_TARGET`，其余请求仍从 `dist/` 提供静态文件，并保留单页应用路由回退。
+
 ## 运行依赖
 
 后端运行前需要确认：
@@ -140,6 +153,11 @@ AEROSPACE_SKIP_UPLOAD_DIR_SYNC
 AEROSPACE_HF_ENABLE_PARALLEL_LOADING
 AEROSPACE_CORS_ORIGINS
 AEROSPACE_MAX_UPLOAD_MB
+RETRIEVAL_AGENT_TIMEOUT
+RETRIEVAL_AGENT_MAX_TOKENS
+RETRIEVAL_AGENT_CACHE_TTL_SECONDS
+RETRIEVAL_AGENT_CACHE_MAX_ITEMS
+ENABLE_KNOWLEDGE_GRAPH
 ```
 
 ## 数据和 Git 边界

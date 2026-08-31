@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
@@ -31,11 +32,13 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 AGENT_ENABLED = os.environ.get("RETRIEVAL_AGENT_ENABLED", "true").lower() in ("1", "true", "yes")
-AGENT_TIMEOUT = float(os.environ.get("RETRIEVAL_AGENT_TIMEOUT", "8.0"))
+AGENT_TIMEOUT = float(os.environ.get("RETRIEVAL_AGENT_TIMEOUT", "3.0"))
 AGENT_MODEL = os.environ.get("RETRIEVAL_AGENT_MODEL", "qwen-turbo")
 AGENT_TEMPERATURE = float(os.environ.get("RETRIEVAL_AGENT_TEMPERATURE", "0.1"))
-AGENT_MAX_TOKENS = int(os.environ.get("RETRIEVAL_AGENT_MAX_TOKENS", "800"))
+AGENT_MAX_TOKENS = int(os.environ.get("RETRIEVAL_AGENT_MAX_TOKENS", "400"))
 AGENT_MIN_CONFIDENCE = float(os.environ.get("RETRIEVAL_AGENT_MIN_CONFIDENCE", "0.5"))
+AGENT_CACHE_TTL_SECONDS = max(0.0, float(os.environ.get("RETRIEVAL_AGENT_CACHE_TTL_SECONDS", "300")))
+AGENT_CACHE_MAX_ITEMS = max(1, int(os.environ.get("RETRIEVAL_AGENT_CACHE_MAX_ITEMS", "256")))
 
 QWEN_API_KEY = os.environ.get("QWEN_API_KEY", "")
 QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -226,6 +229,32 @@ class RetrievalAgent:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self._client = None
+        self._plan_cache: Dict[Tuple[str, str], Tuple[float, AgentRetrievalPlan]] = {}
+        self._plan_cache_lock = threading.RLock()
+
+    def _get_cached_plan(self, query: str, hardcoded_intent: str) -> Optional[AgentRetrievalPlan]:
+        if AGENT_CACHE_TTL_SECONDS <= 0:
+            return None
+        key = (query.strip(), hardcoded_intent.strip())
+        with self._plan_cache_lock:
+            cached = self._plan_cache.get(key)
+            if cached is None:
+                return None
+            created_at, plan = cached
+            if time.monotonic() - created_at > AGENT_CACHE_TTL_SECONDS:
+                self._plan_cache.pop(key, None)
+                return None
+            return plan
+
+    def _cache_plan(self, query: str, hardcoded_intent: str, plan: AgentRetrievalPlan) -> None:
+        if AGENT_CACHE_TTL_SECONDS <= 0:
+            return
+        key = (query.strip(), hardcoded_intent.strip())
+        with self._plan_cache_lock:
+            if len(self._plan_cache) >= AGENT_CACHE_MAX_ITEMS and key not in self._plan_cache:
+                oldest_key = next(iter(self._plan_cache))
+                self._plan_cache.pop(oldest_key, None)
+            self._plan_cache[key] = (time.monotonic(), plan)
 
     def _get_client(self):
         """Lazy-initialize the OpenAI-compatible client."""
@@ -365,6 +394,11 @@ class RetrievalAgent:
         if not query or not str(query).strip():
             return empty_plan
 
+        cached_plan = self._get_cached_plan(query, hardcoded_intent)
+        if cached_plan is not None:
+            logger.debug("Using cached retrieval agent plan for query: %s", query[:80])
+            return cached_plan
+
         start_time = time.time()
 
         try:
@@ -392,9 +426,11 @@ class RetrievalAgent:
                 )
                 plan.used_agent = False
                 # Keep reasoning for debugging but don't apply
+                self._cache_plan(query, hardcoded_intent, plan)
                 return plan
 
             plan.used_agent = True
+            self._cache_plan(query, hardcoded_intent, plan)
             logger.info(
                 "Retrieval agent plan: intent=%s type=%s channels=%s disabled=%s confidence=%.2f latency=%.0fms",
                 plan.intent, plan.query_type,

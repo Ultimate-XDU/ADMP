@@ -1,5 +1,6 @@
 import { createReadStream, existsSync, statSync } from "node:fs";
-import { createServer } from "node:http";
+import { createServer, request as requestHttp } from "node:http";
+import { request as requestHttps } from "node:https";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -8,6 +9,7 @@ const scriptDir = path.dirname(scriptFile);
 const projectRoot = path.resolve(scriptDir, "..");
 const distRoot = path.join(projectRoot, "dist");
 const port = Number.parseInt(process.env.PORT ?? "4173", 10);
+const apiTarget = new URL(process.env.API_PROXY_TARGET ?? "http://127.0.0.1:8787");
 
 const contentTypes = new Map([
   [".html", "text/html; charset=utf-8"],
@@ -37,7 +39,8 @@ function resolveRequestPath(urlPath) {
   const relativePath = cleaned === "" ? "index.html" : cleaned;
   const resolvedPath = path.resolve(distRoot, relativePath);
 
-  if (!resolvedPath.startsWith(distRoot)) {
+  const relativeToDist = path.relative(distRoot, resolvedPath);
+  if (relativeToDist.startsWith("..") || path.isAbsolute(relativeToDist)) {
     return null;
   }
 
@@ -52,7 +55,37 @@ function resolveRequestPath(urlPath) {
   return undefined;
 }
 
+function proxyApiRequest(req, res) {
+  const requestApi = apiTarget.protocol === "https:" ? requestHttps : requestHttp;
+  const upstream = requestApi(
+    {
+      protocol: apiTarget.protocol,
+      hostname: apiTarget.hostname,
+      port: apiTarget.port || undefined,
+      method: req.method,
+      path: `${apiTarget.pathname.replace(/\/$/, "")}${req.url}`,
+      headers: { ...req.headers, host: apiTarget.host },
+    },
+    (upstreamResponse) => {
+      res.writeHead(upstreamResponse.statusCode ?? 502, upstreamResponse.headers);
+      upstreamResponse.pipe(res);
+    },
+  );
+  upstream.on("error", (error) => {
+    console.error(`[serve:dist] API proxy failed: ${error.message}`);
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "application/json; charset=utf-8" });
+    }
+    res.end(JSON.stringify({ detail: "Backend API is unavailable" }));
+  });
+  req.pipe(upstream);
+}
+
 createServer((req, res) => {
+  if (req.url?.startsWith("/api/") || req.url === "/api" || req.url?.startsWith("/api?")) {
+    proxyApiRequest(req, res);
+    return;
+  }
   const resolvedPath = resolveRequestPath(req.url);
 
   if (resolvedPath === null) {
@@ -73,4 +106,5 @@ createServer((req, res) => {
 }).listen(port, () => {
   console.log(`[serve:dist] Serving ${distRoot}`);
   console.log(`[serve:dist] Open http://localhost:${port}`);
+  console.log(`[serve:dist] Proxying /api to ${apiTarget.origin}${apiTarget.pathname.replace(/\/$/, "")}`);
 });

@@ -183,7 +183,7 @@ def build_document_chunks(units: List[dict], embedder) -> List[dict]:
             )
             heading_stack.append({"level": level, "text": unit["content"]})
             if progress_interval and index % progress_interval == 0:
-                print(f"    * 切片进度：{index}/{total_units} 单元，当前证据块数：{len(blocks)}")
+                logger.info("切片进度：%d/%d 单元，当前证据块数：%d", index, total_units, len(blocks))
             continue
 
         if source_type == "table":
@@ -213,7 +213,7 @@ def build_document_chunks(units: List[dict], embedder) -> List[dict]:
                 }
             )
             if progress_interval and index % progress_interval == 0:
-                print(f"    * 切片进度：{index}/{total_units} 单元，当前证据块数：{len(blocks)}")
+                logger.info("切片进度：%d/%d 单元，当前证据块数：%d", index, total_units, len(blocks))
             continue
 
         if pending_text_units:
@@ -224,7 +224,7 @@ def build_document_chunks(units: List[dict], embedder) -> List[dict]:
         pending_text_units.append(unit)
         pending_chars += len(unit["content"])
         if progress_interval and index % progress_interval == 0:
-            print(f"    * 切片进度：{index}/{total_units} 单元，当前证据块数：{len(blocks)}")
+            logger.info("切片进度：%d/%d 单元，当前证据块数：%d", index, total_units, len(blocks))
 
     flush_pending()
     return build_chain(blocks)
@@ -253,10 +253,16 @@ def _encode_with_progress(embedder, contents: List[str], batch_size: int = 128, 
         arrays.append(np.asarray(batch_embeddings, dtype=np.float32))
         batch_elapsed = time.time() - batch_started_at
         total_elapsed = time.time() - started_at
-        print(
-            f"    * {stage_label}进度：{end}/{total} 块 "
-            f"({end / total:.1%})，batch {batch_index}/{total_batches}，"
-            f"本批 {batch_elapsed:.1f}s，累计 {total_elapsed:.1f}s"
+        logger.info(
+            "%s进度：%d/%d 块（%.1f%%），batch %d/%d，本批 %.1fs，累计 %.1fs",
+            stage_label,
+            end,
+            total,
+            end / total * 100,
+            batch_index,
+            total_batches,
+            batch_elapsed,
+            total_elapsed,
         )
 
     if len(arrays) == 1:
@@ -388,13 +394,13 @@ def get_embedder():
         with _embedder_lock:
             if _embedder is None:
                 started_at = time.time()
-                print('加载嵌入模型（本地缓存）...')
+                logger.info("加载嵌入模型（本地缓存）")
                 _embedder = SentenceTransformer(EMBEDDING_MODEL, local_files_only=True)
                 if torch.cuda.is_available():
                     _embedder = _embedder.to("cuda")
-                    print(f"嵌入模型已加载到 GPU，用时 {time.time() - started_at:.1f}s")
+                    logger.info("嵌入模型已加载到 GPU，用时 %.1fs", time.time() - started_at)
                 else:
-                    print(f"嵌入模型使用 CPU，用时 {time.time() - started_at:.1f}s")
+                    logger.info("嵌入模型使用 CPU，用时 %.1fs", time.time() - started_at)
     return _embedder
 
 
@@ -405,16 +411,16 @@ def get_reranker():
             if _reranker is None:
                 try:
                     started_at = time.time()
-                    print("加载重排序模型（本地缓存）...")
+                    logger.info("加载重排序模型（本地缓存）")
                     rerank_device = "cuda" if RERANK_DEVICE == "cuda" and torch.cuda.is_available() else "cpu"
                     _reranker = CrossEncoder(
                         RERANK_MODEL,
                         device=rerank_device,
                         local_files_only=True,
                     )
-                    print(f"重排序模型加载完成（{rerank_device}），用时 {time.time() - started_at:.1f}s")
+                    logger.info("重排序模型加载完成（%s），用时 %.1fs", rerank_device, time.time() - started_at)
                 except Exception as exc:
-                    print(f"重排序模型加载失败：{exc}，将跳过重排序。")
+                    logger.warning("重排序模型加载失败，将跳过重排序: %s", exc)
                     _reranker = None
     return _reranker
 
@@ -596,6 +602,7 @@ class DualDBManager:
                         scroll_id=scroll_id,
                         scroll="2m",
                     )
+                    scroll_id = response.get("_scroll_id", scroll_id)
             finally:
                 if scroll_id:
                     try:
@@ -632,24 +639,24 @@ class DualDBManager:
     def _index_document_blocks(self, file_path: str) -> Tuple[List[dict], dict]:
         started_at = time.time()
         units, health = extract_document_units(file_path)
-        print(f"  - 文本单元提取完成：{len(units)} 个单元，用时 {time.time() - started_at:.1f}s")
+        logger.info("文本单元提取完成：%d 个单元，用时 %.1fs", len(units), time.time() - started_at)
         if not units:
             return [], health
         structure_started_at = time.time()
         structural_records = build_structural_records(units, os.path.basename(file_path))
         save_structural_records(os.path.basename(file_path), structural_records)
         health["structural_record_count"] = len(structural_records)
-        print(f"  - 结构记录构建完成：{len(structural_records)} 条，用时 {time.time() - structure_started_at:.1f}s")
+        logger.info("结构记录构建完成：%d 条，用时 %.1fs", len(structural_records), time.time() - structure_started_at)
         chunk_started_at = time.time()
-        print("  - 开始生成证据块...")
+        logger.info("开始生成证据块")
         blocks = build_document_chunks(units, self._get_embedder())
-        print(f"  - 证据块切片完成：{len(blocks)} 个，用时 {time.time() - chunk_started_at:.1f}s")
+        logger.info("证据块切片完成：%d 个，用时 %.1fs", len(blocks), time.time() - chunk_started_at)
         attach_started_at = time.time()
-        print("  - 开始挂载结构标签...")
+        logger.info("开始挂载结构标签")
         blocks = attach_structure_to_blocks(blocks, structural_records)
-        print(f"  - 结构标签挂载完成，用时 {time.time() - attach_started_at:.1f}s")
+        logger.info("结构标签挂载完成，用时 %.1fs", time.time() - attach_started_at)
         health["chunk_count"] = len(blocks)
-        print(f"  - 证据块生成完成：{len(blocks)} 个，用时 {time.time() - chunk_started_at:.1f}s")
+        logger.info("证据块生成完成：%d 个，用时 %.1fs", len(blocks), time.time() - chunk_started_at)
         if blocks:
             low_conf_chunks = sum(1 for block in blocks if block.get("parse_confidence", 0.0) < 0.55)
             health["low_confidence_chunk_ratio"] = round(low_conf_chunks / len(blocks), 4)
@@ -682,8 +689,7 @@ class DualDBManager:
         self._remove_doc_from_milvus(collection, file_name)
         self._remove_doc_from_es(file_name)
 
-        print(f"增量索引：{file_name}")
-        print("  - 开始解析与结构化...")
+        logger.info("增量索引：%s，开始解析与结构化", file_name)
         blocks, health = self._index_document_blocks(file_path)
         if not blocks:
             return IndexOperationResult(
@@ -696,20 +702,20 @@ class DualDBManager:
             )
 
         contents = [_truncate_for_milvus_varchar(block.get("retrieval_text", block["content"])) for block in blocks]
-        print(f"  - 开始向量化：{len(contents)} 个块")
+        logger.info("开始向量化：%d 个块", len(contents))
         embedding_started_at = time.time()
         embeddings = _encode_with_progress(self._get_embedder(), contents, stage_label="向量化")
-        print(f"  - 向量化完成，用时 {time.time() - embedding_started_at:.1f}s")
+        logger.info("向量化完成，用时 %.1fs", time.time() - embedding_started_at)
         milvus_started_at = time.time()
-        print("  - 写入 Milvus...")
+        logger.info("写入 Milvus")
         self._insert_blocks_to_milvus(collection, blocks, embeddings.tolist(), contents)
         collection.flush()
         collection.load()
-        print(f"  - Milvus 写入完成，用时 {time.time() - milvus_started_at:.1f}s")
+        logger.info("Milvus 写入完成，用时 %.1fs", time.time() - milvus_started_at)
         es_started_at = time.time()
-        print("  - 写入 Elasticsearch...")
+        logger.info("写入 Elasticsearch")
         save_metadata_to_es(self.es_client, blocks)
-        print(f"  - Elasticsearch 写入完成，用时 {time.time() - es_started_at:.1f}s")
+        logger.info("Elasticsearch 写入完成，用时 %.1fs", time.time() - es_started_at)
         _persist_document_health_reports({file_name: health})
 
         # Optional: build knowledge graph from indexed blocks
@@ -718,12 +724,18 @@ class DualDBManager:
         try:
             from knowledge.graph import GRAPH_ENABLED, build_graph_from_units, get_global_graph, save_global_graph
             if GRAPH_ENABLED:
-                print("  - 构建知识图谱...")
+                logger.info("构建知识图谱")
                 graph_started_at = time.time()
                 graph = get_global_graph()
+                graph.remove_document(file_name)
                 build_graph_from_units(blocks, existing_graph=graph)
                 save_global_graph()
-                print(f"  - 知识图谱构建完成，用时 {time.time() - graph_started_at:.1f}s (总计 {graph.entity_count} 实体, {graph.relation_count} 关系)")
+                logger.info(
+                    "知识图谱构建完成，用时 %.1fs（总计 %d 实体，%d 关系）",
+                    time.time() - graph_started_at,
+                    graph.entity_count,
+                    graph.relation_count,
+                )
         except Exception as graph_exc:
             logger.warning("知识图谱构建失败（不影响入库结果）: %s", graph_exc)
 
@@ -752,6 +764,12 @@ class DualDBManager:
         self._remove_doc_from_es(doc_name)
         _remove_document_health_report(doc_name)
         remove_structural_records(doc_name)
+        try:
+            from knowledge.graph import GRAPH_ENABLED, remove_document_from_global_graph
+            if GRAPH_ENABLED:
+                remove_document_from_global_graph(doc_name)
+        except Exception as graph_exc:
+            logger.warning("知识图谱删除清理失败（不影响索引删除）: %s", graph_exc)
         return IndexOperationResult(
             success=True,
             action="remove_document",
@@ -792,7 +810,7 @@ class DualDBManager:
         all_blocks: List[dict] = []
         for file_name in files:
             path = os.path.join(DOC_DIR, file_name)
-            print(f"解析文档：{file_name}")
+            logger.info("解析文档：%s", file_name)
             blocks, health = self._index_document_blocks(path)
             reports[file_name] = health
             all_blocks.extend(blocks)

@@ -44,166 +44,28 @@ import {
   type AssistantMessage,
   type AssistantMessageSegment,
   type AssistantSource,
-} from "./aviationAssistantMock";
-
-type Chapter = {
-  code: string;
-  title: string;
-  subtitle: string;
-  accent: string;
-  accentSoft: string;
-  secondary: string;
-  glow: string;
-};
-
-type AppRoute = "launch" | "system" | "trace" | "upload" | "assistant";
-
-type KnowledgeBaseRecord = {
-  id: number;
-  name: string;
-  description: string;
-  creator: string;
-  createdAt: string;
-};
-
-type DocumentStatus = "READY" | "INDEXING" | "CHUNKING" | "SYNCED" | "FAILED";
-
-type UploadStage = "idle" | "uploading" | "indexing" | "saving" | "done" | "error";
-
-type DocumentRecord = {
-  id: number;
-  fileName: string;
-  knowledgeBaseId: number;
-  type: "PDF" | "DOCX" | "PPTX" | "XLSX";
-  size: string;
-  chunkCount: number;
-  status: DocumentStatus;
-  uploadedAt: string;
-  summary: string;
-};
-
-type KnowledgeBasePayload = Pick<KnowledgeBaseRecord, "name" | "description"> & Partial<Pick<KnowledgeBaseRecord, "creator">>;
-
-type DocumentPayload = Pick<DocumentRecord, "fileName" | "knowledgeBaseId" | "type" | "size" | "chunkCount" | "status" | "summary">;
-
-type ManagementDeleteState =
-  | { type: "knowledgeBase"; id: number }
-  | { type: "document"; id: number };
-
-type AssistantLaunchState = {
-  left: number;
-  top: number;
-  width: number;
-  height: number;
-};
-
-type AssistantHistoryItem = {
-  id: string;
-  title: string;
-  question: string;
-  createdAt: number;
-  preview: string;
-  conversation?: AssistantConversation;
-};
-
-const routePathMap: Record<AppRoute, string> = {
-  launch: "/",
-  system: "/system",
-  trace: "/trace",
-  upload: "/upload",
-  assistant: "/aviation-assistant",
-};
-
-const chapterRoutes: AppRoute[] = ["system", "trace", "upload", "assistant"];
-
-function normalizePathname(pathname: string) {
-  const normalized = pathname.replace(/\/+$/, "");
-  return normalized === "" ? "/" : normalized;
-}
-
-function resolveRoute(pathname: string): AppRoute {
-  switch (normalizePathname(pathname)) {
-    case "/":
-      return "launch";
-    case "/system":
-    case "/qa":
-      return "system";
-    case "/trace":
-      return "trace";
-    case "/upload":
-    case "/intake":
-      return "upload";
-    case "/aviation-assistant":
-    case "/assistant":
-      return "assistant";
-    default:
-      return "launch";
-  }
-}
-
-function getChapterIndexForRoute(route: AppRoute) {
-  switch (route) {
-    case "system":
-      return 0;
-    case "trace":
-      return 1;
-    case "upload":
-      return 2;
-    case "assistant":
-      return 3;
-    default:
-      return 0;
-  }
-}
-
-const introTheme: Chapter = {
-  code: "00",
-  title: "Launch Deck",
-  subtitle: "Aerospace Knowledge Command Core",
-  accent: "#ff5e7e",
-  accentSoft: "rgba(255, 94, 126, 0.14)",
-  secondary: "#ffcb5b",
-  glow: "radial-gradient(circle at center, rgba(255,94,126,0.30), transparent 68%)",
-};
-
-const chapters: Chapter[] = [
-  {
-    code: "01",
-    title: "Grounded QA",
-    subtitle: "Primary Question Answering Workspace",
-    accent: "#ff78c8",
-    accentSoft: "rgba(255, 120, 200, 0.15)",
-    secondary: "#d9ff52",
-    glow: "radial-gradient(circle at center, rgba(255,120,200,0.24), transparent 68%)",
-  },
-  {
-    code: "02",
-    title: "Retrieval Trace",
-    subtitle: "Backend Hybrid Retrieval Observation",
-    accent: "#d6ff3f",
-    accentSoft: "rgba(214, 255, 63, 0.15)",
-    secondary: "#ff7a8d",
-    glow: "radial-gradient(circle at center, rgba(214,255,63,0.24), transparent 68%)",
-  },
-  {
-    code: "03",
-    title: "知识库和文档管理",
-    subtitle: "Knowledge Base and Document Management",
-    accent: "#ff9a3c",
-    accentSoft: "rgba(255, 154, 60, 0.16)",
-    secondary: "#d8ff58",
-    glow: "radial-gradient(circle at center, rgba(255,154,60,0.28), transparent 68%)",
-  },
-  {
-    code: "04",
-    title: "智能问答检索",
-    subtitle: "航空文档智能问答检索",
-    accent: "#7fe0ff",
-    accentSoft: "rgba(127, 224, 255, 0.14)",
-    secondary: "#ffcb5b",
-    glow: "radial-gradient(circle at center, rgba(127,224,255,0.26), transparent 68%)",
-  },
-];
+} from "./assistant-types";
+import { DonutChart } from "./components/DonutChart";
+import {
+  type AppRoute,
+  type AssistantHistoryItem,
+  type AssistantLaunchState,
+  type Chapter,
+  type DocumentStatus,
+  type DocumentPayload,
+  type DocumentRecord,
+  type KnowledgeBasePayload,
+  type KnowledgeBaseRecord,
+  type ManagementDeleteState,
+  type UploadStage,
+  chapterRoutes,
+  chapters,
+  getChapterIndexForRoute,
+  introTheme,
+  normalizePathname,
+  resolveRoute,
+  routePathMap,
+} from "./app-model";
 
 const pageVariants: Variants[] = [
   {
@@ -5928,58 +5790,6 @@ function AviationAssistantPage({
           </motion.div>
         ) : null}
       </AnimatePresence>
-    </div>
-  );
-}
-
-function DonutChart({ data, size = 140, strokeWidth = 18 }: { data: { label: string; value: number; color: string }[]; size?: number; strokeWidth?: number }) {
-  const total = data.reduce((sum, item) => sum + item.value, 0);
-  const radius = (size - strokeWidth) / 2;
-  const circumference = 2 * Math.PI * radius;
-  let accumulated = 0;
-
-  return (
-    <div className="flex flex-col items-center gap-3">
-      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="drop-shadow-[0_0_12px_rgba(255,255,255,0.06)]">
-        <circle cx={size / 2} cy={size / 2} r={radius} fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth={strokeWidth} />
-        {data.map((item) => {
-          const ratio = item.value / total;
-          const dashLength = circumference * ratio;
-          const gap = circumference - dashLength;
-          const offset = -circumference * accumulated + circumference * 0.25;
-          accumulated += ratio;
-          return (
-            <circle
-              key={item.label}
-              cx={size / 2}
-              cy={size / 2}
-              r={radius}
-              fill="none"
-              stroke={item.color}
-              strokeWidth={strokeWidth}
-              strokeDasharray={`${dashLength} ${gap}`}
-              strokeDashoffset={offset}
-              strokeLinecap="butt"
-              className="transition-all duration-700"
-            />
-          );
-        })}
-        <text x={size / 2} y={size / 2 - 6} textAnchor="middle" fill="white" fontSize="22" fontWeight="600" fontFamily="inherit">
-          {total}
-        </text>
-        <text x={size / 2} y={size / 2 + 14} textAnchor="middle" fill="rgba(255,255,255,0.45)" fontSize="10" letterSpacing="0.12em" fontFamily="inherit">
-          TOTAL
-        </text>
-      </svg>
-      <div className="grid grid-cols-2 gap-x-4 gap-y-1">
-        {data.map((item) => (
-          <div key={item.label} className="flex items-center gap-2 text-[11px] text-white/60">
-            <span className="inline-block h-2 w-2 shrink-0 rounded-full" style={{ background: item.color }} />
-            <span className="truncate">{item.label}</span>
-            <span className="ml-auto tabular-nums text-white/40">{item.value}</span>
-          </div>
-        ))}
-      </div>
     </div>
   );
 }

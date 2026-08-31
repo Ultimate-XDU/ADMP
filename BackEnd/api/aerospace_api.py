@@ -955,7 +955,7 @@ def _persist_management_state():
         _state_store.save(payload)
         clear_contract_caches()
     except Exception as exc:
-        print(f"[WARN] 保存管理状态失败: {exc}")
+        logger.warning("保存管理状态失败: %s", exc)
 
 
 def _load_document_health_report_map() -> dict[str, dict]:
@@ -1124,7 +1124,7 @@ def _load_management_state():
         try:
             payload = _state_store.load()
         except Exception as exc:
-            print(f"[WARN] 读取管理状态失败，将回退到默认配置: {exc}")
+            logger.warning("读取管理状态失败，将回退到默认配置: %s", exc)
         else:
             stored_knowledge_bases = payload.get("knowledgeBases")
             if isinstance(stored_knowledge_bases, list):
@@ -1671,9 +1671,5 @@ def summarize_title(req: SummarizeTitleRequest):
 # ==========================================
 if __name__ == "__main__":
     import uvicorn
-    print("=" * 60)
-    print("🚀 航空航天知识检索 API 服务")
-    print("   地址: http://127.0.0.1:8787")
-    print("   文档: http://127.0.0.1:8787/docs")
-    print("=" * 60)
+    logger.info("航空航天知识检索 API 服务启动：http://127.0.0.1:8787，文档：http://127.0.0.1:8787/docs")
     uvicorn.run(app, host="0.0.0.0", port=8787)
