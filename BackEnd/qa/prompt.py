@@ -19,9 +19,22 @@ from search.common import DOC_DIR, logger
 
 from ._shared import _is_structural_evidence
 
-QWEN_API_KEY = os.environ.get("QWEN_API_KEY", "")
-QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-QWEN_MODEL = "qwen-turbo"
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+LLM_API_KEY = DEEPSEEK_API_KEY or os.environ.get("QWEN_API_KEY", "")
+LLM_BASE_URL = os.environ.get(
+    "LLM_BASE_URL",
+    "https://api.deepseek.com" if DEEPSEEK_API_KEY else "https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-v4-flash" if DEEPSEEK_API_KEY else "qwen-turbo")
+LLM_THINKING_ENABLED = os.environ.get("LLM_THINKING_ENABLED", "false").lower() in {"1", "true", "yes", "enabled"}
+LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "").strip().lower()
+
+
+def _normalized_reasoning_effort() -> str:
+    # DeepSeek Chat Completions maps the user-facing medium level to high.
+    if LLM_REASONING_EFFORT == "medium":
+        return "high"
+    return LLM_REASONING_EFFORT
 
 BASE_SYSTEM_PROMPT = """你是一个专门服务于航空工程、维修放行与适航审定场景的专业技术问答助手。
 你的工作目标不是“整理格式”，而是基于证据直接解决用户问题。
@@ -302,19 +315,27 @@ def build_user_prompt(query: str, context: str, query_type: str, history: Option
 
 
 def call_qwen(system_prompt: str, user_prompt: str) -> str:
-    if not QWEN_API_KEY:
-        raise RuntimeError("未设置 QWEN_API_KEY，当前无法调用大模型生成答案。")
+    if not LLM_API_KEY:
+        raise RuntimeError("未设置 LLM API 密钥，当前无法调用大模型生成答案。")
 
-    client = OpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)
-    response = client.chat.completions.create(
-        model=QWEN_MODEL,
-        messages=[
+    client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+    request_options: Dict[str, Any] = {
+        "model": LLM_MODEL,
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.1,
-        max_tokens=1600,
-        timeout=45.0,
-    )
+        "max_tokens": 1600,
+        "timeout": 45.0,
+    }
+    if LLM_THINKING_ENABLED:
+        request_options["extra_body"] = {"thinking": {"type": "enabled"}}
+        effort = _normalized_reasoning_effort()
+        if effort:
+            request_options["reasoning_effort"] = effort
+    else:
+        request_options["temperature"] = 0.1
+
+    response = client.chat.completions.create(**request_options)
     return response.choices[0].message.content or ""
 

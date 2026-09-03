@@ -1260,7 +1260,18 @@ def _relax_focus_terms(intent: str, focus_terms: Sequence[str]) -> Tuple[str, ..
     return tuple(focus_terms)
 
 
-def _strict_coverage_required(query: str, intent: str, targets: Sequence[RetrievalTarget]) -> bool:
+def _strict_coverage_required(
+    query: str,
+    intent: str,
+    targets: Sequence[RetrievalTarget],
+    article_variants: Sequence[str] = (),
+) -> bool:
+    # A verified article identifier is already an exact source constraint.  The
+    # remaining natural-language wording describes what to explain from that
+    # article and must not reject the article merely because interrogative words
+    # such as "规定了什么" do not appear verbatim in its text.
+    if article_variants:
+        return False
     compact = compact_text(query)
     if any(token in compact for token in ("是否", "能否", "可以作为", "能不能", "可不可以")):
         return True
@@ -1315,7 +1326,7 @@ def build_retrieval_contract(query: str) -> RetrievalContract:
         hard_target=hard_target,
         allow_multi_doc=allow_multi_doc,
         requires_table=intent == "table",
-        requires_strict_coverage=_strict_coverage_required(query, intent, targets),
+        requires_strict_coverage=_strict_coverage_required(query, intent, targets, article_variants),
         requires_all_focus_terms=_all_focus_required(query, intent),
         block_reason=block_reason,
     )

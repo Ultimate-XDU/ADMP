@@ -53,6 +53,7 @@ from search.query_analysis import (
     _has_structural_subject_support,
     _is_valid_search_query,
     _strip_contract_identity_terms,
+    _structural_subject_match_score,
     analyze_query_intent,
     logger,
 )
@@ -152,6 +153,7 @@ from utils.structure import (
     clear_structural_records,
     load_all_structural_records,
     remove_structural_records,
+    resolve_exact_article_records,
     save_structural_records,
 )
 from utils.retrieval_contract import (
@@ -1482,6 +1484,7 @@ class HybridSearch:
             precision_hints = profile.get("precision_hints") or {}
             route = str(precision_hints.get("route") or "")
             subject_terms = [_compact_match_text(term) for term in precision_hints.get("subject_terms", []) if term]
+            subject_modifiers = [_compact_match_text(term) for term in precision_hints.get("subject_modifiers", []) if term]
             intent_terms = [_compact_match_text(term) for term in precision_hints.get("intent_terms", []) if term]
             title_keyphrases = [_compact_match_text(term) for term in precision_hints.get("title_keyphrases", []) if term]
             title_compact = _compact_match_text(
@@ -1491,6 +1494,10 @@ class HybridSearch:
                 )
             )
             title_subject_hits = sum(1 for term in subject_terms if term and _has_unmodified_subject(title_compact, term))
+            subject_support = max(
+                (_structural_subject_match_score(modifier, joined_text) for modifier in subject_modifiers),
+                default=0.0,
+            )
             title_intent_hits = sum(1 for term in intent_terms if term and term in title_compact)
             title_keyphrase_hits = sum(1 for term in title_keyphrases if term and term in title_compact)
             joined_keyphrase_hits = sum(1 for term in title_keyphrases if term and term in _compact_match_text(joined_text[:700]))
@@ -1504,8 +1511,19 @@ class HybridSearch:
                 score += min(1.4, 0.28 * joined_keyphrase_hits)
             if title_subject_hits:
                 score += 2.2 + 0.45 * title_subject_hits
+            if subject_modifiers:
+                score += 3.2 * subject_support
+                if subject_support <= 0.0:
+                    score -= 0.85
             if title_intent_hits:
                 score += 1.05 + 0.25 * title_intent_hits
+                # For procedure and application questions, an article heading
+                # that expresses several requested actions is a stronger route
+                # than a neighbouring article that merely mentions them in a
+                # long body.  This keeps the primary regulatory procedure ahead
+                # of related implementation or amendment provisions.
+                if record_type == "article" and title_intent_hits >= 2:
+                    score += 1.5 * title_intent_hits
             if title_subject_hits and title_intent_hits:
                 score += 2.2
                 if record_type in {"article", "section"}:
@@ -2245,6 +2263,30 @@ class HybridSearch:
 
             structural_profile, contract = self._build_retrieval_profile(query, contract)
             structural_records = load_all_structural_records()
+            query_signature = structural_profile.get("query_signature", {})
+            exact_article_ids = list(query_signature.get("article_id_variants") or contract.article_variants)
+            preferred_doc_names = [
+                str(name)
+                for name in (
+                    structural_profile.get("target_doc_name"),
+                    *_contract_target_doc_names(structural_profile),
+                )
+                if name
+            ]
+            exact_article_records = resolve_exact_article_records(
+                structural_records,
+                exact_article_ids,
+                preferred_doc_names=preferred_doc_names,
+            )
+            if exact_article_records:
+                exact_article_sources = [
+                    self._structural_record_to_evidence(record, 24.0)
+                    for record in exact_article_records
+                ]
+                contracted_exact_articles = _contracted_sources_or_none(contract, exact_article_sources)
+                if contracted_exact_articles:
+                    return contracted_exact_articles
+
             precision_hints = structural_profile.get("precision_hints") or {}
             if not _has_structural_subject_support(precision_hints, structural_records):
                 structural_supported = False
@@ -2265,7 +2307,6 @@ class HybridSearch:
                 contracted_structural = _contracted_sources_or_none(contract, structural_definition_answer["sources"])
                 if contracted_structural:
                     return contracted_structural
-            query_signature = structural_profile.get("query_signature", {})
             if structural_supported and query_signature.get("article_id_variants") and structural_profile.get("target_doc_name"):
                 exact_records = [
                     record

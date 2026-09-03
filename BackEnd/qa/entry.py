@@ -70,21 +70,26 @@ def ask_structured(query: str, engine: HybridSearch = None, history: Optional[Li
     if engine is None:
         with HybridSearch(hyde_llm_call=call_qwen) as local_engine:
             return ask_structured(query, engine=local_engine, history=history)
-    structural_records = load_all_structural_records()
-    structural_count_answer = answer_structural_count(query, structural_records)
-    finalized_structural = _finalized_contract_answer_or_none(structural_count_answer, contract, query_type, engine)
-    if finalized_structural:
-        return finalized_structural
+    # A named article is an exact primary key.  Let the article-resolution path
+    # own it before broad count/classification/definition shortcuts inspect the
+    # same wording; otherwise a clause marker such as "(a)" can be interpreted
+    # as a document-level counting target instead of part of the cited article.
+    if not contract.article_variants:
+        structural_records = load_all_structural_records()
+        structural_count_answer = answer_structural_count(query, structural_records)
+        finalized_structural = _finalized_contract_answer_or_none(structural_count_answer, contract, query_type, engine)
+        if finalized_structural:
+            return finalized_structural
 
-    structural_classification_answer = answer_structural_classification(query, structural_records)
-    finalized_structural = _finalized_contract_answer_or_none(structural_classification_answer, contract, query_type, engine)
-    if finalized_structural:
-        return finalized_structural
+        structural_classification_answer = answer_structural_classification(query, structural_records)
+        finalized_structural = _finalized_contract_answer_or_none(structural_classification_answer, contract, query_type, engine)
+        if finalized_structural:
+            return finalized_structural
 
-    structural_definition_answer = answer_structural_definition(query, structural_records)
-    finalized_structural = _finalized_contract_answer_or_none(structural_definition_answer, contract, query_type, engine)
-    if finalized_structural:
-        return finalized_structural
+        structural_definition_answer = answer_structural_definition(query, structural_records)
+        finalized_structural = _finalized_contract_answer_or_none(structural_definition_answer, contract, query_type, engine)
+        if finalized_structural:
+            return finalized_structural
     definition_term = _definition_query_term(query)
     if definition_term and not contract.article_variants and not (contract.required_terms or contract.focus_terms or contract.targets):
         return {

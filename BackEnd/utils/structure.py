@@ -894,6 +894,55 @@ def _children(records: List[Dict], parent_id: str) -> List[Dict]:
     return sorted(rows, key=lambda item: (int(item.get("page_start") or 1), int(item.get("order") or 0), str(item.get("number") or "")))
 
 
+def resolve_exact_article_records(
+    records: Iterable[Dict],
+    article_ids: Iterable[str],
+    preferred_doc_names: Optional[Iterable[str]] = None,
+) -> List[Dict]:
+    """Resolve an unambiguous, explicitly referenced article from the structure cache.
+
+    An article number is a primary identifier, not a semantic hint.  This helper
+    therefore returns the complete article record only when the identifier maps
+    to one document, or when the caller supplies a matching document scope.  If
+    the same article number exists in several documents without a document scope,
+    it deliberately returns no record so the normal retrieval path can disambiguate
+    from the question text instead of mixing regulatory sources.
+    """
+    requested_ids = {_compact_text(article_id) for article_id in article_ids if _compact_text(article_id)}
+    if not requested_ids:
+        return []
+
+    by_document: Dict[str, List[Dict]] = {}
+    for record in records:
+        if record.get("is_toc") or str(record.get("record_type") or "") != "article":
+            continue
+        article_id = _compact_text(str(record.get("article_id") or record.get("number") or ""))
+        doc_name = str(record.get("doc_name") or "")
+        if not doc_name or article_id not in requested_ids:
+            continue
+        by_document.setdefault(doc_name, []).append(record)
+
+    if not by_document:
+        return []
+
+    preferred = [str(name or "") for name in preferred_doc_names or [] if name]
+    for doc_name in preferred:
+        if doc_name in by_document:
+            return sorted(
+                by_document[doc_name],
+                key=lambda item: (int(item.get("page_start") or 1), int(item.get("order") or 0)),
+            )[:1]
+
+    if len(by_document) != 1:
+        return []
+
+    only_records = next(iter(by_document.values()))
+    return sorted(
+        only_records,
+        key=lambda item: (int(item.get("page_start") or 1), int(item.get("order") or 0)),
+    )[:1]
+
+
 def _matched_doc_names_from_query(query: str, records: List[Dict]) -> List[str]:
     compact_query = _compact_text(query)
     matched: List[Tuple[int, str]] = []

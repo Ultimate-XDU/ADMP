@@ -33,15 +33,28 @@ logger = logging.getLogger(__name__)
 
 AGENT_ENABLED = os.environ.get("RETRIEVAL_AGENT_ENABLED", "true").lower() in ("1", "true", "yes")
 AGENT_TIMEOUT = float(os.environ.get("RETRIEVAL_AGENT_TIMEOUT", "3.0"))
-AGENT_MODEL = os.environ.get("RETRIEVAL_AGENT_MODEL", "qwen-turbo")
+AGENT_MODEL = os.environ.get("RETRIEVAL_AGENT_MODEL", os.environ.get("LLM_MODEL", "qwen-turbo"))
 AGENT_TEMPERATURE = float(os.environ.get("RETRIEVAL_AGENT_TEMPERATURE", "0.1"))
 AGENT_MAX_TOKENS = int(os.environ.get("RETRIEVAL_AGENT_MAX_TOKENS", "400"))
 AGENT_MIN_CONFIDENCE = float(os.environ.get("RETRIEVAL_AGENT_MIN_CONFIDENCE", "0.5"))
 AGENT_CACHE_TTL_SECONDS = max(0.0, float(os.environ.get("RETRIEVAL_AGENT_CACHE_TTL_SECONDS", "300")))
 AGENT_CACHE_MAX_ITEMS = max(1, int(os.environ.get("RETRIEVAL_AGENT_CACHE_MAX_ITEMS", "256")))
 
-QWEN_API_KEY = os.environ.get("QWEN_API_KEY", "")
-QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+LLM_API_KEY = DEEPSEEK_API_KEY or os.environ.get("QWEN_API_KEY", "")
+LLM_BASE_URL = os.environ.get(
+    "LLM_BASE_URL",
+    "https://api.deepseek.com" if DEEPSEEK_API_KEY else "https://dashscope.aliyuncs.com/compatible-mode/v1",
+)
+LLM_THINKING_ENABLED = os.environ.get("LLM_THINKING_ENABLED", "false").lower() in ("1", "true", "yes", "enabled")
+LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "").strip().lower()
+
+
+def _normalized_reasoning_effort() -> str:
+    # DeepSeek Chat Completions maps the user-facing medium level to high.
+    if LLM_REASONING_EFFORT == "medium":
+        return "high"
+    return LLM_REASONING_EFFORT
 
 # All available retrieval channels
 ALL_CHANNELS: Tuple[str, ...] = (
@@ -260,11 +273,11 @@ class RetrievalAgent:
         """Lazy-initialize the OpenAI-compatible client."""
         if self._client is not None:
             return self._client
-        if not QWEN_API_KEY:
+        if not LLM_API_KEY:
             return None
         try:
             from openai import OpenAI
-            self._client = OpenAI(api_key=QWEN_API_KEY, base_url=QWEN_BASE_URL)
+            self._client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
             return self._client
         except Exception as exc:
             logger.warning("Failed to initialize LLM client for retrieval agent: %s", exc)
@@ -279,16 +292,24 @@ class RetrievalAgent:
         if client is None:
             raise RuntimeError("LLM client not available")
 
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=[
+        request_options: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            timeout=self.timeout,
-        )
+            "max_tokens": self.max_tokens,
+            "timeout": self.timeout,
+        }
+        if LLM_THINKING_ENABLED:
+            request_options["extra_body"] = {"thinking": {"type": "enabled"}}
+            effort = _normalized_reasoning_effort()
+            if effort:
+                request_options["reasoning_effort"] = effort
+        else:
+            request_options["temperature"] = self.temperature
+
+        response = client.chat.completions.create(**request_options)
         return response.choices[0].message.content or ""
 
     @staticmethod

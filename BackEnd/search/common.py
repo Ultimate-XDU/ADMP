@@ -98,11 +98,15 @@ METADATA_CACHE_MAX_ITEMS = max(_env_int("AEROSPACE_METADATA_CACHE_MAX_ITEMS", 40
 
 BASE_DIR = Path(__file__).resolve().parent
 
-DOC_DIR = str(BASE_DIR.parent / "aerospace_docs")
+# Keep the canonical document location as a Path.  The retrieval, structural
+# parsing, and direct PDF-answer paths all use filesystem operations; exposing
+# one path-like value prevents callers from silently mixing string joins with
+# Path traversal.
+DOC_DIR = BASE_DIR.parent / "aerospace_docs"
 
 
 def _consolidate_legacy_doc_dirs() -> None:
-    canonical_dir = Path(DOC_DIR)
+    canonical_dir = DOC_DIR
     legacy_dirs = (
         BASE_DIR / "aerospace_docs",
         BASE_DIR.parent / "api" / "aerospace_docs",
@@ -137,7 +141,7 @@ def _consolidate_legacy_doc_dirs() -> None:
 
 
 try:
-    Path(DOC_DIR).mkdir(parents=True, exist_ok=True)
+    DOC_DIR.mkdir(parents=True, exist_ok=True)
     _consolidate_legacy_doc_dirs()
 except OSError:
     pass

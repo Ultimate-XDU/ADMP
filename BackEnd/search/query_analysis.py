@@ -559,6 +559,31 @@ def infer_query_precision_hints(query: str) -> dict:
     return hints
 
 
+def _structural_subject_match_score(modifier: str, haystack: str) -> float:
+    """Return structural support for a query subject without requiring verbatim prose.
+
+    Regulatory text commonly separates an entity and its action with modal verbs
+    or qualification phrases.  A binary substring check rejects that valid
+    evidence.  Consecutive character n-gram coverage keeps the match precise
+    while allowing those small insertions.
+    """
+    subject = _compact_match_text(modifier)
+    text = _compact_match_text(haystack)
+    if not subject or not text:
+        return 0.0
+    if subject in text:
+        return 1.0
+    if len(subject) < 6:
+        return 0.0
+
+    gram_size = 4 if len(subject) >= 10 else 3
+    grams = {subject[index : index + gram_size] for index in range(len(subject) - gram_size + 1)}
+    if not grams:
+        return 0.0
+    coverage = sum(1 for gram in grams if gram in text) / len(grams)
+    return round(coverage, 6) if coverage >= 0.55 else 0.0
+
+
 def _has_structural_subject_support(hints: dict, records: List[dict]) -> bool:
     modifiers = [_compact_match_text(term) for term in hints.get("subject_modifiers", []) if term]
     if not modifiers:
@@ -574,7 +599,7 @@ def _has_structural_subject_support(hints: dict, records: List[dict]) -> bool:
         if not record.get("is_toc")
     ]
     for modifier in modifiers:
-        if not any(modifier in text for text in haystacks):
+        if not any(_structural_subject_match_score(modifier, text) > 0.0 for text in haystacks):
             return False
     return True
 
