@@ -1,0 +1,253 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif;
+  background: #07080b;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100dvh;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  overflow: clip;
+  background: #07080b;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+.cut-panel {
+  clip-path: polygon(0 0, calc(100% - 24px) 0, 100% 24px, 100% 100%, 16px 100%, 0 calc(100% - 16px));
+}
+
+.cut-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(120deg, transparent 0%, transparent 64%, color-mix(in srgb, var(--panel-accent) 38%, transparent) 100%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.07), transparent 18%);
+  opacity: 0.14;
+}
+
+.cut-panel::after {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  pointer-events: none;
+  border: 1px solid color-mix(in srgb, var(--panel-accent) 36%, rgba(255, 255, 255, 0.05));
+  clip-path: polygon(0 0, calc(100% - 24px) 0, 100% 24px, 100% 100%, 16px 100%, 0 calc(100% - 16px));
+  opacity: 0.22;
+}
+
+.scan-overlay {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.04) 0%, transparent 16%, transparent 84%, rgba(255, 255, 255, 0.04) 100%),
+    repeating-linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.04) 0,
+      rgba(255, 255, 255, 0.04) 1px,
+      transparent 1px,
+      transparent 4px
+    );
+  mask-image: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.8) 20%, rgba(0, 0, 0, 0.8) 80%, transparent);
+  animation: scanFlow 6s linear infinite;
+}
+
+.stage-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+}
+
+.stage-scroll::-webkit-scrollbar {
+  width: 10px;
+}
+
+.stage-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.stage-scroll::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.28), rgba(255, 255, 255, 0.08)) content-box;
+}
+
+.panel-scroll {
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+}
+
+.panel-scroll::-webkit-scrollbar {
+  width: 1px;
+}
+
+.panel-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.panel-scroll::-webkit-scrollbar:horizontal {
+  height: 0;
+}
+
+.panel-scroll::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.02));
+}
+
+.evidence-scroll {
+  scrollbar-gutter: auto;
+}
+
+.evidence-scroll::-webkit-scrollbar {
+  width: 1px;
+}
+
+.assistant-console-scroll {
+  scrollbar-gutter: auto;
+}
+
+.assistant-main-panel,
+.assistant-evidence-panel {
+  background: transparent !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
+
+.assistant-main-panel::before,
+.assistant-main-panel::after,
+.assistant-evidence-panel::before,
+.assistant-evidence-panel::after {
+  display: none;
+}
+
+.paper-shell {
+  background:
+    linear-gradient(180deg, rgba(255, 252, 246, 0.98) 0%, rgba(247, 242, 231, 0.98) 100%),
+    radial-gradient(circle at top left, rgba(255, 255, 255, 0.95) 0%, transparent 42%);
+  box-shadow:
+    0 26px 70px rgba(0, 0, 0, 0.22),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.45);
+}
+
+.paper-shell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.045), transparent 14%, transparent 86%, rgba(0, 0, 0, 0.045) 100%),
+    radial-gradient(circle at top right, rgba(255, 255, 255, 0.42), transparent 28%);
+  opacity: 0.85;
+}
+
+.paper-shell::after {
+  content: "";
+  position: absolute;
+  inset: 18px;
+  pointer-events: none;
+  border: 1px solid rgba(22, 21, 18, 0.08);
+  border-radius: 28px;
+}
+
+.paper-panel {
+  background: rgba(255, 255, 255, 0.6);
+  box-shadow:
+    inset 0 0 0 1px rgba(22, 21, 18, 0.08),
+    0 10px 36px rgba(0, 0, 0, 0.08);
+}
+
+.paper-card {
+  background: rgba(255, 255, 255, 0.82);
+  box-shadow:
+    0 8px 0 rgba(17, 17, 17, 0.05),
+    0 16px 28px rgba(0, 0, 0, 0.07);
+}
+
+.sketch-section-panel {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.022) 0%, rgba(255, 255, 255, 0.012) 100%),
+    radial-gradient(circle at top left, rgba(255, 255, 255, 0.022) 0%, transparent 42%);
+  border-radius: 0 !important;
+  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.3);
+  clip-path: polygon(0 0, calc(100% - 34px) 0, 100% 34px, 100% 100%, 18px 100%, 0 calc(100% - 18px));
+}
+
+.sketch-section-panel::before {
+  clip-path: polygon(0 0, calc(100% - 34px) 0, 100% 34px, 100% 100%, 18px 100%, 0 calc(100% - 18px));
+}
+
+.sketch-section-panel::after {
+  opacity: 0.3;
+  clip-path: polygon(0 0, calc(100% - 34px) 0, 100% 34px, 100% 100%, 18px 100%, 0 calc(100% - 18px));
+}
+
+.tactical-hover-frame {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  transition:
+    background-color 260ms ease,
+    border-color 260ms ease,
+    box-shadow 260ms ease,
+    filter 260ms ease;
+}
+
+.tactical-hover-frame::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0;
+  background:
+    radial-gradient(
+      210px circle at var(--frame-pointer-x, 50%) var(--frame-pointer-y, 50%),
+      color-mix(in srgb, var(--frame-accent, var(--panel-accent, #d8ff58)) 26%, transparent),
+      transparent 72%
+    ),
+    linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.045), transparent);
+  transition: opacity 260ms ease;
+}
+
+.tactical-hover-frame:hover::before {
+  opacity: 1;
+}
+
+.tactical-hover-frame:hover {
+  box-shadow:
+    inset 0 0 0 1px color-mix(in srgb, var(--frame-accent, var(--panel-accent, #d8ff58)) 26%, transparent),
+    0 0 26px color-mix(in srgb, var(--frame-accent, var(--panel-accent, #d8ff58)) 10%, transparent);
+}
+
+.tactical-hover-frame > * {
+  position: relative;
+  z-index: 1;
+}
+
+@keyframes scanFlow {
+  0% {
+    transform: translateY(-10%);
+  }
+  100% {
+    transform: translateY(10%);
+  }
+}
