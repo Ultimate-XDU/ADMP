@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+# Start ADMP as a local application: Elasticsearch on this machine, Milvus Lite
+# inside the API process, then the API and the web UI. No Docker.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SHARE="${ADMP_HOME:-${HOME}/.local/share/admp}"
+CACHE="${SHARE}/cache"
+ES_VERSION="8.4.1"
+ES_HOME="${SHARE}/elasticsearch"
+DATA_DIR="${ROOT}/BackEnd/data"
+ES_DATA="${DATA_DIR}/elasticsearch"
+ES_LOG="${SHARE}/elasticsearch-logs"
+PID_DIR="${DATA_DIR}/run"
+VENV="${ROOT}/.venv"
+
+if [[ -f "${HOME}/.config/wsl/proxy.sh" ]]; then
+  # shellcheck disable=SC1091
+  source "${HOME}/.config/wsl/proxy.sh"
+fi
+
+mkdir -p "${CACHE}" "${ES_DATA}" "${ES_LOG}" "${PID_DIR}" "${DATA_DIR}"
+
+log() { printf '%s\n' "$*"; }
+
+download() {
+  local url="$1" dest="$2"
+  if [[ -s "${dest}" ]]; then
+    return 0
+  fi
+  log "下载 ${url}"
+  curl -fL --retry 3 --retry-delay 2 -o "${dest}.partial" "${url}"
+  mv "${dest}.partial" "${dest}"
+}
+
+install_jre() {
+  if [[ -x "${SHARE}/jre/bin/java" ]]; then
+    return 0
+  fi
+  local archive="${CACHE}/temurin17-jre.tar.gz"
+  download "https://api.adoptium.net/v3/binary/latest/17/ga/linux/x64/jre/hotspot/normal/eclipse?project=jdk" "${archive}"
+  rm -rf "${SHARE}/jre-src"
+  mkdir -p "${SHARE}/jre-src"
+  tar -C "${SHARE}/jre-src" -xzf "${archive}"
+  local java_bin
+  java_bin="$(find "${SHARE}/jre-src" -type f -path '*/bin/java' | head -n 1)"
+  if [[ -z "${java_bin}" ]]; then
+    echo "没有在 Temurin 压缩包里找到 java" >&2
+    exit 1
+  fi
+  ln -sfn "$(dirname "$(dirname "${java_bin}")")" "${SHARE}/jre"
+}
+
+install_elasticsearch() {
+  if [[ -x "${ES_HOME}/bin/elasticsearch" ]]; then
+    return 0
+  fi
+  local archive="${CACHE}/elasticsearch-${ES_VERSION}-linux-x86_64.tar.gz"
+  download "https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-${ES_VERSION}-linux-x86_64.tar.gz" "${archive}"
+  rm -rf "${SHARE}/elasticsearch-${ES_VERSION}"
+  tar -C "${SHARE}" -xzf "${archive}"
+  rm -rf "${ES_HOME}"
+  mv "${SHARE}/elasticsearch-${ES_VERSION}" "${ES_HOME}"
+}
+
+write_es_config() {
+  cat > "${ES_HOME}/config/elasticsearch.yml" << EOF
+cluster.name: admp-local
+node.name: admp
+discovery.type: single-node
+network.host: 127.0.0.1
+http.port: 9200
+xpack.security.enabled: false
+xpack.security.http.ssl.enabled: false
+xpack.security.transport.ssl.enabled: false
+ingest.geoip.downloader.enabled: false
+path.data: ${ES_DATA}
+path.logs: ${ES_LOG}
+EOF
+}
+
+install_ik() {
+  if [[ -d "${ES_HOME}/plugins/analysis-ik" ]]; then
+    return 0
+  fi
+  local zip="${CACHE}/elasticsearch-analysis-ik-${ES_VERSION}.zip"
+  download "https://get.infini.cloud/elasticsearch/analysis-ik/${ES_VERSION}" "${zip}"
+  ES_JAVA_HOME="${SHARE}/jre" "${ES_HOME}/bin/elasticsearch-plugin" install --batch "file://${zip}"
+}
+
+es_ready() {
+  curl -fsS --max-time 3 "http://127.0.0.1:9200" >/dev/null 2>&1
+}
+
+start_elasticsearch() {
+  write_es_config
+  install_ik
+  if es_ready; then
+    log "Elasticsearch 已在 http://127.0.0.1:9200"
+    return 0
+  fi
+  log "启动 Elasticsearch"
+  ES_JAVA_HOME="${SHARE}/jre" \
+    ES_JAVA_OPTS="${ES_JAVA_OPTS:--Xms512m -Xmx1g}" \
+    "${ES_HOME}/bin/elasticsearch" -d -p "${PID_DIR}/elasticsearch.pid"
+  local attempt
+  for attempt in $(seq 1 60); do
+    if es_ready; then
+      log "Elasticsearch 就绪"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "Elasticsearch 没有在 120 秒内就绪，日志在 ${ES_LOG}" >&2
+  exit 1
+}
+
+install_python() {
+  local base="${ADMP_PYTHON:-}"
+  if [[ -z "${base}" && -x "${HOME}/nvllm-env/bin/python" ]]; then
+    base="${HOME}/nvllm-env/bin/python"
+  fi
+  if [[ -z "${base}" ]]; then
+    base="$(command -v python3)"
+  fi
+  if [[ ! -x "${VENV}/bin/python" ]]; then
+    "${base}" -m venv "${VENV}" --system-site-packages
+  fi
+  "${VENV}/bin/python" -m pip install -r "${ROOT}/requirements.txt"
+}
+
+export_app_env() {
+  export AEROSPACE_EMBEDDING_MODEL="${AEROSPACE_EMBEDDING_MODEL:-}"
+  export AEROSPACE_RERANK_MODEL="${AEROSPACE_RERANK_MODEL:-}"
+  if [[ -z "${AEROSPACE_EMBEDDING_MODEL}" && -d "/mnt/d/ADMP/models/BAAI--bge-m3" ]]; then
+    export AEROSPACE_EMBEDDING_MODEL="/mnt/d/ADMP/models/BAAI--bge-m3"
+  fi
+  if [[ -z "${AEROSPACE_RERANK_MODEL}" && -d "/mnt/d/ADMP/models/BAAI--bge-reranker-v2-m3" ]]; then
+    export AEROSPACE_RERANK_MODEL="/mnt/d/ADMP/models/BAAI--bge-reranker-v2-m3"
+  fi
+  export MILVUS_MODE=embedded
+  export QWEN_API_KEY="${QWEN_API_KEY:-ollama}"
+  export LLM_BASE_URL="${LLM_BASE_URL:-http://127.0.0.1:11434/v1}"
+  export LLM_MODEL="${LLM_MODEL:-qwen3.5:9b}"
+  export LLM_THINKING_ENABLED="${LLM_THINKING_ENABLED:-false}"
+  export RETRIEVAL_AGENT_TIMEOUT="${RETRIEVAL_AGENT_TIMEOUT:-20}"
+}
+
+start_backend() {
+  if curl -fsS --max-time 3 "http://127.0.0.1:8787/api/health" >/dev/null 2>&1; then
+    log "后端已在 http://127.0.0.1:8787"
+    return 0
+  fi
+  log "启动后端"
+  export_app_env
+  (
+    cd "${ROOT}/BackEnd"
+    nohup "${VENV}/bin/python" -m api.aerospace_api > "${PID_DIR}/backend.log" 2>&1 &
+    echo $! > "${PID_DIR}/backend.pid"
+  )
+  local attempt
+  for attempt in $(seq 1 60); do
+    if curl -fsS --max-time 3 "http://127.0.0.1:8787/api/health" >/dev/null 2>&1; then
+      log "后端就绪 http://127.0.0.1:8787"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "后端没有就绪。查看 ${PID_DIR}/backend.log" >&2
+  exit 1
+}
+
+start_frontend() {
+  if curl -fsS --max-time 3 "http://127.0.0.1:5173" >/dev/null 2>&1; then
+    log "前端已在 http://127.0.0.1:5173"
+    return 0
+  fi
+  log "启动前端"
+  (
+    cd "${ROOT}/FrontEnd"
+    nohup npm run dev -- --host 127.0.0.1 --port 5173 > "${PID_DIR}/frontend.log" 2>&1 &
+    echo $! > "${PID_DIR}/frontend.pid"
+  )
+  local attempt
+  for attempt in $(seq 1 60); do
+    if curl -fsS --max-time 3 "http://127.0.0.1:5173" >/dev/null 2>&1; then
+      log "前端就绪 http://127.0.0.1:5173"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "前端没有就绪。查看 ${PID_DIR}/frontend.log" >&2
+  exit 1
+}
+
+install_jre
+install_elasticsearch
+start_elasticsearch
+install_python
+start_backend
+start_frontend
+log "ADMP 已在本机运行"
+log "页面  http://127.0.0.1:5173"
+log "接口  http://127.0.0.1:8787/api/health"

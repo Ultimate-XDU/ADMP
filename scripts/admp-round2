@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd /home/yuexing/src/ADMP-graphrag-20261111
+exec python3 scripts/admp-round2-runtime.py

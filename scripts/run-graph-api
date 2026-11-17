@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Isolated graph API for the checkout. Embeddings stay on CPU inside this process.
+# Ollama is not started here. Point GRAPH_OLLAMA_HOST at the server that is already up.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export PYTHONPATH="${ROOT}/BackEnd${PYTHONPATH:+:$PYTHONPATH}"
+export GRAPH_OLLAMA_HOST="${GRAPH_OLLAMA_HOST:-http://127.0.0.1:11435}"
+export GRAPH_LLM_MODEL="${GRAPH_LLM_MODEL:-${LLM_MODEL:-qwen3.5:9b}}"
+export GRAPH_API_PORT="${GRAPH_API_PORT:-8788}"
+export GRAPH_EXTRACT_SCOPE="${GRAPH_EXTRACT_SCOPE:-pilot}"
+export GRAPH_DATA_DIR="${GRAPH_DATA_DIR:-${ROOT}/work/graph-data}"
+exec "${ROOT}/work/venv/bin/python" -m uvicorn api.graph_api:app \
+  --app-dir "${ROOT}/BackEnd" \
+  --host 127.0.0.1 \
+  --port "${GRAPH_API_PORT}"

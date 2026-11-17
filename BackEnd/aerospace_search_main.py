@@ -1,0 +1,256 @@
+"""
+aerospace_search_main - Compatibility entry point.
+Re-exports all public APIs from the refactored modules.
+
+Original module was split into:
+  - search_common: config, constants, base utilities, text/structure detection
+  - query_analysis: query intent, precision hints, retrieval policy, HyDE
+  - document_pipeline: PDF parsing, layout detection, chunking, metadata building
+  - evidence_scoring: query alignment, quality scoring, highlight selection
+  - index_manager: document chunking, encoding, ES/Milvus management, DualDBManager
+  - hybrid_search: HybridSearch class, multi-channel retrieval, RRF fusion, rerank
+"""
+
+from search.common import (
+    ACTION_VARIANT_MODIFIERS,
+    ARTICLE_ALIAS_PROFILE,
+    ARTICLE_LABEL_PATTERN,
+    ARTICLE_PRECISION_PROFILE,
+    ARTICLE_RECALL,
+    ARTICLE_REFERENCE_PROFILE,
+    BASE_DIR,
+    CCAR_PART_PATTERN,
+    CHINESE_NUMERAL_DIGITS,
+    CHINESE_NUMERAL_UNITS,
+    CLASSIFICATION_TERMS,
+    CLAUSE_PATTERN,
+    CODE_LEXICAL_PROFILE,
+    CODE_REFERENCE_PATTERN,
+    CONTRACT_INTENT_QUERY_TYPE,
+    DECIMAL_HEADING_PATTERN,
+    DEFINITION_TERMS,
+    DOC_DIR,
+    DOT_HEADING_PATTERN,
+    EFFECTIVE_DATE_TERMS,
+    EMBEDDING_MODEL,
+    ES_HOST,
+    ES_INDEX,
+    ES_QUERY_TIMEOUT_SECONDS,
+    ES_REQUEST_TIMEOUT_SECONDS,
+    ES_SLOW_QUERY_SECONDS,
+    FusionPolicy,
+    HEADING_ALIAS_PROFILE,
+    HEADING_RECALL,
+    HEALTH_REPORT_FILE,
+    HYDE_SYSTEM_PROMPT,
+    INDEXED_STRUCTURAL_FIELDS,
+    IndexOperationResult,
+    KEYWORD_ALIAS_PROFILE,
+    KW_RECALL,
+    LIST_ITEM_PATTERN,
+    MAX_CHUNK_OVERLAP,
+    MAX_CHUNK_SIZE,
+    METADATA_CACHE_MAX_ITEMS,
+    MILVUS_COLLECTION,
+    MILVUS_CONTENT_MAX,
+    MILVUS_HOST,
+    MILVUS_PORT,
+    NOTE_TERMS,
+    NUMBERED_HEADING_PATTERN,
+    PDF_PAGE_CACHE_MAX_ITEMS,
+    PROCEDURE_TERMS,
+    QA_TOP_K,
+    REQUIREMENT_TERMS,
+    RERANK_DEVICE,
+    RERANK_MODEL,
+    ROUTE_TITLE_ACTION_TERMS,
+    RecallBudget,
+    RetrievalPolicy,
+    SECTION_LABEL_PATTERN,
+    SPECIFICITY_MODIFIERS,
+    STRUCTURE_ALIAS_PROFILE,
+    STRUCTURE_PRECISION_PROFILE,
+    STRUCTURE_REFERENCE_PROFILE,
+    TABLE_ALIAS_PROFILE,
+    TABLE_PRECISION_PROFILE,
+    TABLE_RECALL,
+    TARGET_DOC_ALIAS_PROFILE,
+    TOP_K,
+    VECTOR_DIM,
+    VEC_RECALL,
+    clean_block_text,
+    detect_heading,
+    infer_document_type,
+    logger,
+)
+
+from search.query_analysis import (
+    analyze_query_intent,
+    infer_query_precision_hints,
+)
+
+from search.document_pipeline import (
+    build_chain,
+    extract_document_units,
+    semantic_split,
+)
+
+from search.index_manager import (
+    DualDBManager,
+    build_document_chunks,
+    format_structural_context,
+    get_chunk_context,
+    get_embedder,
+    get_reranker,
+    save_metadata_to_es,
+)
+
+from search.hybrid_search import (
+    HybridSearch,
+)
+
+from search.retrieval_agent import (
+    AgentRetrievalPlan,
+    RetrievalAgent,
+    agent_enhanced_retrieval_policy,
+    apply_agent_plan_to_profile,
+    apply_agent_plan_to_recall_budget,
+    get_retrieval_agent,
+)
+
+from search.document_parser_mineru import (
+    MinerUParser,
+    get_mineru_parser,
+    is_mineru_available,
+    parse_pdf_with_mineru,
+)
+
+from knowledge.graph import (
+    EntityType,
+    KnowledgeEntity,
+    KnowledgeGraph,
+    KnowledgeRelation,
+    RelationType,
+    build_graph_from_units,
+    extract_entities_from_query,
+    get_global_graph,
+    graph_expand_query,
+    save_global_graph,
+)
+
+# Re-export modules themselves for attribute-style access
+import search.common
+import search.query_analysis
+import search.document_pipeline
+import search.evidence_scoring
+import search.index_manager
+import search.hybrid_search
+import search.retrieval_agent
+import search.document_parser_mineru
+import knowledge.graph
+
+__all__ = [
+    "ACTION_VARIANT_MODIFIERS",
+    "AgentRetrievalPlan",
+    "ARTICLE_ALIAS_PROFILE",
+    "ARTICLE_LABEL_PATTERN",
+    "ARTICLE_PRECISION_PROFILE",
+    "ARTICLE_RECALL",
+    "ARTICLE_REFERENCE_PROFILE",
+    "BASE_DIR",
+    "CCAR_PART_PATTERN",
+    "CHINESE_NUMERAL_DIGITS",
+    "CHINESE_NUMERAL_UNITS",
+    "CLASSIFICATION_TERMS",
+    "CLAUSE_PATTERN",
+    "CODE_LEXICAL_PROFILE",
+    "CODE_REFERENCE_PATTERN",
+    "CONTRACT_INTENT_QUERY_TYPE",
+    "DECIMAL_HEADING_PATTERN",
+    "DEFINITION_TERMS",
+    "DOC_DIR",
+    "DOT_HEADING_PATTERN",
+    "DualDBManager",
+    "EFFECTIVE_DATE_TERMS",
+    "EMBEDDING_MODEL",
+    "ES_HOST",
+    "ES_INDEX",
+    "ES_QUERY_TIMEOUT_SECONDS",
+    "ES_REQUEST_TIMEOUT_SECONDS",
+    "ES_SLOW_QUERY_SECONDS",
+    "FusionPolicy",
+    "HEADING_ALIAS_PROFILE",
+    "HEADING_RECALL",
+    "HEALTH_REPORT_FILE",
+    "HYDE_SYSTEM_PROMPT",
+    "HybridSearch",
+    "INDEXED_STRUCTURAL_FIELDS",
+    "IndexOperationResult",
+    "KEYWORD_ALIAS_PROFILE",
+    "KW_RECALL",
+    "LIST_ITEM_PATTERN",
+    "MAX_CHUNK_OVERLAP",
+    "MAX_CHUNK_SIZE",
+    "METADATA_CACHE_MAX_ITEMS",
+    "MILVUS_COLLECTION",
+    "MILVUS_CONTENT_MAX",
+    "MILVUS_HOST",
+    "MILVUS_PORT",
+    "NOTE_TERMS",
+    "NUMBERED_HEADING_PATTERN",
+    "PDF_PAGE_CACHE_MAX_ITEMS",
+    "PROCEDURE_TERMS",
+    "QA_TOP_K",
+    "REQUIREMENT_TERMS",
+    "RERANK_DEVICE",
+    "RERANK_MODEL",
+    "ROUTE_TITLE_ACTION_TERMS",
+    "RecallBudget",
+    "RetrievalPolicy",
+    "SECTION_LABEL_PATTERN",
+    "SPECIFICITY_MODIFIERS",
+    "STRUCTURE_ALIAS_PROFILE",
+    "STRUCTURE_PRECISION_PROFILE",
+    "STRUCTURE_REFERENCE_PROFILE",
+    "TABLE_ALIAS_PROFILE",
+    "TABLE_PRECISION_PROFILE",
+    "TABLE_RECALL",
+    "TARGET_DOC_ALIAS_PROFILE",
+    "TOP_K",
+    "VECTOR_DIM",
+    "VEC_RECALL",
+    "analyze_query_intent",
+    "build_chain",
+    "build_document_chunks",
+    "clean_block_text",
+    "detect_heading",
+    "extract_document_units",
+    "format_structural_context",
+    "get_chunk_context",
+    "get_embedder",
+    "get_reranker",
+    "infer_document_type",
+    "infer_query_precision_hints",
+    "logger",
+    "save_metadata_to_es",
+    "semantic_split",
+    "RetrievalAgent",
+    "agent_enhanced_retrieval_policy",
+    "apply_agent_plan_to_profile",
+    "apply_agent_plan_to_recall_budget",
+    "get_retrieval_agent",
+    "MinerUParser",
+    "get_mineru_parser",
+    "is_mineru_available",
+    "parse_pdf_with_mineru",
+    "EntityType",
+    "KnowledgeEntity",
+    "KnowledgeGraph",
+    "KnowledgeRelation",
+    "RelationType",
+    "build_graph_from_units",
+    "extract_entities_from_query",
+    "get_global_graph",
+    "graph_expand_query",
+    "save_global_graph",
+]
